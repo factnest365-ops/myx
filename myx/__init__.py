@@ -1,0 +1,1 @@
+"""MYX terminal music player."""
