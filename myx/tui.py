@@ -463,19 +463,14 @@ def run(state_path: Path = STATE_PATH, out: IO[str] = sys.stdout) -> int:
                 if events:
                     key = sys.stdin.read(1)
                     if key == "/":
-                        # Line-mode search without network in the renderer itself. sources.search is imported lazily.
                         out.write("\x1b[2K\rsearch: ")
                         out.flush()
                         termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
                         query = sys.stdin.readline().strip()
                         tty.setcbreak(sys.stdin.fileno())
                         try:
-                            from myx import sources  # type: ignore
-
-                            results = sources.search(query)
-                            for item in results:
-                                send_command("load", url=item.get("id") or item.get("url") or "")
-                            renderer.toast = f"queued {len(results)}"
+                            resp = send_command("search", arg=query)
+                            renderer.toast = resp.get("error") or f"queued: {query}"
                         except Exception as exc:
                             renderer.toast = str(exc)
                     else:

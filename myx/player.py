@@ -248,10 +248,19 @@ class PlayerDaemon:
                 self._mpv(["loadfile", _url(str(arg)), "replace"])
                 self.seen.add(str(arg))
             elif cmd == "load":
-                self._mpv(["loadfile", str(arg), "replace"])
+                self._mpv(["loadfile", str(arg), "append"])
                 vid = _video_id(str(arg))
                 if vid:
                     self.seen.add(vid)
+            elif cmd == "search":
+                try:
+                    for item in sources.search(str(arg)):
+                        vid2 = item.get("id")
+                        if vid2:
+                            self._mpv(["loadfile", _url(str(vid2)), "append"])
+                            self.seen.add(str(vid2))
+                except sources.SourcesError as exc:
+                    return {"ok": False, "error": str(exc)}
             elif cmd == "jump":
                 self._mpv(["seek", float(arg), "absolute"])
             elif cmd == "quit":

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import urllib.error
 import urllib.parse
@@ -9,7 +10,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-YTDLP = "/opt/homebrew/bin/yt-dlp"
+YTDLP = shutil.which("yt-dlp") or "/opt/homebrew/bin/yt-dlp"
 TIMEOUT = 20
 
 
@@ -73,6 +74,8 @@ def mix_chain(video_id: str) -> list[str]:
     url = f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}"
     out = _run_ytdlp([
         "--flat-playlist",
+        "--playlist-end",
+        "25",
         "--no-warnings",
         "-j",
         "--extractor-args",
@@ -132,4 +135,6 @@ def lyrics(title: str, artist: str, duration_s: int | float | None = None) -> di
         raise SourcesError(f"lyrics lookup failed: HTTP {exc.code}") from exc
     except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
         raise SourcesError(f"lyrics lookup failed: {exc}") from exc
+    if not isinstance(data, dict):
+        return {"lrc": None, "plain": None}
     return {"lrc": data.get("syncedLyrics"), "plain": data.get("plainLyrics")}

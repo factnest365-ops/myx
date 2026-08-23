@@ -92,10 +92,7 @@ def cleanup(proc: subprocess.Popen[str] | None) -> None:
 
 
 def queue_search(query: str) -> None:
-    from myx import sources  # type: ignore
-
-    for item in sources.search(query):
-        tui.send_command("load", url=item.get("id") or item.get("url") or "")
+    tui.send_command("search", arg=query)
 
 
 def main(argv: list[str] | None = None) -> int:
