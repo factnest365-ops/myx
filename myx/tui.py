@@ -365,10 +365,21 @@ class Renderer:
         def put(y: int, x: int, text: str) -> None:
             if not (0 <= y < rows) or x >= cols:
                 return
-            plain_width = cols - x
-            text = text[: plain_width + 80]
+            vis = cell_len(text)
+            allow = cols - x
+            if vis > allow:
+                # footer/toast rows need full overflow so the keybind strip stays intact
+                if y >= rows - 2:
+                    raw = strip_ansi(canvas[y])
+                    pre = raw[:x]
+                    canvas[y] = bg("bg") + fg("fg") + pre + text + RESET
+                    return
+                text = strip_ansi(text)[: max(0, allow)]
+                vis = cell_len(text)
             raw = strip_ansi(canvas[y])
-            canvas[y] = bg("bg") + raw[:x] + text + RESET + raw[x + min(cell_len(text), plain_width) :]
+            pre = raw[:x]
+            post = raw[x + vis :] if x + vis < cols else ""
+            canvas[y] = bg("bg") + fg("fg") + pre + text + post + RESET
 
         put(0, 1, fg("accent") + BOLD + "M Y X" + RESET)
         tabs = [("now", "Now Playing"), ("lyrics", "Lyrics"), ("queue", "Queue")]
@@ -382,17 +393,20 @@ class Renderer:
             if idx == 0 and active:
                 pass
         tabs_str = "".join(tab_parts)
-        # fallback if we want spec literal; keep dynamic highlight
         put(0, cols - cell_len(strip_ansi(tabs_str)) - 2, tabs_str)
+        # vertical divider
+        for yy in range(1, rows - 1):
+            put(yy, left_w, fg("dim") + "│" + RESET)
         self._draw_queue(canvas, put, state, left_w, body_h)
         if self.view == "lyrics":
-            self._draw_lyrics(put, state, left_w + 1, 2, right_w, body_h - 2)
+            self._draw_lyrics(put, state, left_w + 1, 1, right_w, body_h - 1)
         elif self.view == "queue":
-            self._draw_queue_full(put, state, left_w + 1, 2, right_w, body_h - 2)
+            self._draw_queue_full(put, state, left_w + 1, 1, right_w, body_h - 1)
         else:
-            self._draw_now(put, state, left_w + 1, 2, right_w, body_h - 2)
+            self._draw_now(put, state, left_w + 1, 1, right_w, body_h - 1)
         footer = fg("dim") + FOOTER + RESET
-        put(rows - 1, max(0, (cols - len(FOOTER)) // 2), footer)
+        # spec: always full footer visible — write at 0, not centered-clip
+        put(rows - 1, 0, footer)
         if self.toast:
             put(rows - 2, 2, fg("accent") + self.toast + RESET)
         frame = CLEAR + HIDE + "\n".join(canvas)
@@ -405,28 +419,34 @@ class Renderer:
         current = {"title": state.get("title"), "artist": state.get("artist"), "duration": state.get("duration"), "thumb": state.get("thumb")}
         items = [current] + list(queue)
         total = len(items)
-        pos = min(total, 1)
-        # clamp selected to valid range
+        pos = 1
+        total_sec = int(sum(float(i.get("duration") or 0) for i in items))
         self.selected = max(0, min(self.selected, max(0, total - 1)))
-        put(2, 2, fg("dim") + f"< Library  {pos}/{max(total,1)} · {int(sum(float(i.get('duration') or 0) for i in items))}" + RESET)
+        put(1, 2, fg("dim") + f"< Library  {pos}/{max(total,1)} · {total_sec}" + RESET)
         header = "▸ Play Liked Songs"
-        put(3, 3, bg("accent") + fg("bg") + pad(header, width - 5) + RESET)
-        y = 4
-        for i, item in enumerate(items[: max(0, height - 4)]):
+        put(2, 2, bg("accent") + fg("bg") + " " + pad(header, width - 4) + " " + RESET)
+        y = 3
+        avail = max(0, height - 4)
+        for i, item in enumerate(items[:avail]):
             title = str(item.get("title") or "Unknown")
             artist = str(item.get("artist") or "")
-            line = crop(title, max(8, width - 10))
-            if artist:
-                line = pad(line, width - 10) + fg("dim") + crop(artist, 8) + RESET
+            tw = max(8, width - 14)
+            t = crop(title, tw)
+            a = crop(artist, 10) if artist else ""
             if i == 0:
-                color = fg("accent")
+                line = fg("accent") + pad(t, tw) + RESET
+                if a:
+                    line += " " + fg("dim") + a + RESET
             elif i == self.selected:
-                color = bg("accent") + fg("bg")
-            elif i < self.selected:
-                color = fg("dim")
+                line = bg("accent") + fg("bg") + pad(t, tw) + RESET
+                if a:
+                    line += " " + fg("bg") + a + RESET
             else:
-                color = fg("fg")
-            put(y, 3, color + pad(crop(line, width - 4), width - 4) + RESET)
+                base = fg("dim") if i < self.selected else fg("fg")
+                line = base + pad(t, tw) + RESET
+                if a:
+                    line += " " + fg("dim") + a + RESET
+            put(y, 2, " " + line)
             y += 1
 
     def _draw_queue_full(self, put: Any, state: dict[str, Any], x: int, y: int, width: int, height: int) -> None:
@@ -446,32 +466,35 @@ class Renderer:
             put(y + 1 + idx, x, color + pad(crop(line, width), width) + fg("dim") + f" {dur}" + RESET)
 
     def _draw_now(self, put: Any, state: dict[str, Any], x: int, y: int, width: int, height: int) -> None:
-        art_cells = min(40, max(12, min(width - 8, height - 10)))
-        art_rows = max(6, min(art_cells // 2, height - 10))
+        reserved = 12
+        art_h = max(6, height - reserved)
+        art_cells = min(40, max(12, min(width - 4, art_h * 2)))
+        art_rows = max(6, min(art_cells // 2, art_h))
         ax = x + max(0, (width - art_cells) // 2)
+        ay = y
         for n, line in enumerate(self.art.render(state.get("thumb"), art_cells, art_rows)):
-            put(y + n, ax, line)
+            put(ay + n, ax, line)
         title = str(state.get("title") or "Unknown")
         artist = str(state.get("artist") or "")
-        put(y + art_rows + 1, x + max(0, (width - len(title)) // 2), fg("fg") + BOLD + crop(title, width) + RESET)
-        put(y + art_rows + 2, x + max(0, (width - len(artist)) // 2), fg("accent") + crop(artist, width) + RESET)
+        put(ay + art_rows + 1, x + max(0, (width - min(len(title), width - 2)) // 2), fg("fg") + BOLD + crop(title, width - 2) + RESET)
+        if artist:
+            put(ay + art_rows + 2, x + max(0, (width - min(len(artist), width - 2)) // 2), fg("dim") + crop(artist, width - 2) + RESET)
         pos = float(state.get("position") or 0)
         dur = float(state.get("duration") or 0)
-        bar_w = max(10, width - 18)
+        bar_w = max(10, width - 16)
         fill = int((pos / dur) * bar_w) if dur else 0
         bar = "─" * max(0, fill) + "o" + "─" * max(0, bar_w - fill - 1)
-        put(y + art_rows + 4, x + 2, fg("dim") + f"{mmss(pos)} " + fg("accent") + bar + fg("dim") + f" {mmss(dur)}" + RESET)
+        put(ay + art_rows + 4, x + max(0, (width - (bar_w + 10)) // 2), fg("dim") + f"{mmss(pos)} " + fg("accent") + bar + fg("dim") + f" {mmss(dur)}" + RESET)
         vals, peaks = self.spectrum.values_with_peaks()
-        base = y + height - 2
-        max_h = max(3, min(8, height // 3))
+        base = y + height - 1
+        max_h = max(3, min(8, height // 4 if height > 20 else 4))
         start_x = x + max(0, (width - len(vals) * 2) // 2)
         for i, v in enumerate(vals):
             h = max(1, int(v * max_h))
             peak_h = max(1, int(peaks[i] * max_h)) if i < len(peaks) else h
             for j in range(h):
-                frac = (j + 1) / max_h * 0.6 + (i / max(1, len(vals))) * 0.4
+                frac = (j + 1) / max_h * 0.55 + (i / max(1, len(vals))) * 0.45
                 put(base - j, start_x + i * 2, _bar_color(frac) + "█" + RESET)
-            # peak-hold dot one above bar if not overlapping
             if peak_h > h:
                 put(base - peak_h, start_x + i * 2, fg("accent") + "·" + RESET)
             elif peak_h == h and h < max_h:
