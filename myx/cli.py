@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -17,6 +19,7 @@ from . import tui
 
 LOCK_PATH = Path(gettempdir()) / "myx.lock"
 CMD_SOCK = Path(os.environ.get("MYX_CMD_SOCK", Path(gettempdir()) / "myx-cmd.sock"))
+MPV_SOCK = Path(os.environ.get("MYX_MPV_SOCK", Path(gettempdir()) / "myx-mpv.sock"))
 REQUIRED_BINS = {
     "mpv": "install mpv (macOS: brew install mpv)",
     "yt-dlp": "install yt-dlp (macOS: brew install yt-dlp)",
@@ -84,6 +87,7 @@ def cleanup(proc: subprocess.Popen[str] | None) -> None:
             proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             proc.kill()
+    _kill_mpv_socket()
     try:
         if LOCK_PATH.read_text().strip() == str(proc.pid):
             LOCK_PATH.unlink(missing_ok=True)
@@ -131,6 +135,19 @@ def main(argv: list[str] | None = None) -> int:
 
 def raise_sigterm() -> None:
     raise SystemExit(143)
+
+
+def _kill_mpv_socket() -> None:
+    if not MPV_SOCK.exists():
+        return
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5)
+            sock.connect(str(MPV_SOCK))
+            payload = {"command": ["quit"], "request_id": 1}
+            sock.sendall((json.dumps(payload) + "\n").encode())
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":  # pragma: no cover
