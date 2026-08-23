@@ -314,10 +314,24 @@ class PlayerDaemon:
             time.sleep(5)
             if self.stop.is_set():
                 break
-            try:
-                self._mpv(["get_property", "playback-time"])
-            except Exception as exc:
-                print(f"[myx] mpv healthcheck failed: {exc}, restarting", file=sys.stderr)
+            if self.mpv and self.mpv.poll() is not None:
+                print(f"[myx] mpv died (exit {self.mpv.poll()}), restarting", file=sys.stderr)
+                try:
+                    self._restart_mpv()
+                except Exception as exc2:
+                    print(f"[myx] mpv restart failed: {exc2}", file=sys.stderr)
+                continue
+            fails = 0
+            for _ in range(2):
+                try:
+                    self._mpv(["get_property", "idle-active"])
+                    fails = 0
+                    break
+                except Exception:
+                    fails += 1
+                    time.sleep(0.4)
+            if fails >= 2:
+                print("[myx] mpv healthcheck: socket unresponsive, restarting", file=sys.stderr)
                 try:
                     self._restart_mpv()
                 except Exception as exc2:
