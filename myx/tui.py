@@ -127,9 +127,26 @@ def send_command(cmd: str, **payload: Any) -> dict[str, Any]:
 @dataclass
 class SpectrumSource:
     bars: int = 24
+    peaks: list[float] = field(default_factory=list)
+    peak_decay: float = 0.08
+
+    def __post_init__(self) -> None:
+        if not self.peaks:
+            self.peaks = [0.0] * self.bars
 
     def values(self) -> list[float]:
         return [0.04] * self.bars
+
+    def values_with_peaks(self) -> tuple[list[float], list[float]]:
+        vals = self.values()
+        # exponential decay of peaks
+        for i, v in enumerate(vals):
+            if i < len(self.peaks):
+                if v > self.peaks[i]:
+                    self.peaks[i] = v
+                else:
+                    self.peaks[i] = max(0.0, self.peaks[i] - self.peak_decay)
+        return vals, list(self.peaks)
 
     def close(self) -> None:
         pass
@@ -189,6 +206,19 @@ class FfmpegTapSource(SpectrumSource):
     def close(self) -> None:
         if self.proc:
             self.proc.terminate()
+
+
+def _bar_color(frac: float) -> str:
+    """Accent gradient from dim -> accent -> bright by bar height/position."""
+    ar, ag, ab = _rgb(THEME["accent"])
+    dr, dg, db = _rgb(THEME["dim"])
+    # interpolate dim->accent then boost
+    t = max(0.0, min(1.0, frac))
+    r = int(dr + (ar - dr) * t + (255 - ar) * t * 0.15)
+    g = int(dg + (ag - dg) * t + (255 - ag) * t * 0.15)
+    b = int(db + (ab - db) * t + (255 - ab) * t * 0.15)
+    r, g, b = max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b))
+    return f"\x1b[38;2;{r};{g};{b}m"
 
 
 def make_spectrum(stream_url: str | None = None) -> SpectrumSource:
@@ -341,11 +371,24 @@ class Renderer:
             canvas[y] = bg("bg") + raw[:x] + text + RESET + raw[x + min(cell_len(text), plain_width) :]
 
         put(0, 1, fg("accent") + BOLD + "M Y X" + RESET)
-        tabs = "•• Now Playing · Lyrics · Queue"
-        put(0, cols - len(tabs) - 2, fg("accent") + tabs[:2] + fg("fg") + tabs[2:] + RESET)
+        tabs = [("now", "Now Playing"), ("lyrics", "Lyrics"), ("queue", "Queue")]
+        tab_parts: list[str] = []
+        for idx, (key, label) in enumerate(tabs):
+            active = self.view == key or (self.view == "now" and key == "now")
+            if key == "queue" and self.view == "queue":
+                active = True
+            sep = " · " if idx else ""
+            tab_parts.append(sep + (fg("accent") + "•• " + label if active else fg("dim") + label) + RESET)
+            if idx == 0 and active:
+                pass
+        tabs_str = "".join(tab_parts)
+        # fallback if we want spec literal; keep dynamic highlight
+        put(0, cols - cell_len(strip_ansi(tabs_str)) - 2, tabs_str)
         self._draw_queue(canvas, put, state, left_w, body_h)
         if self.view == "lyrics":
             self._draw_lyrics(put, state, left_w + 1, 2, right_w, body_h - 2)
+        elif self.view == "queue":
+            self._draw_queue_full(put, state, left_w + 1, 2, right_w, body_h - 2)
         else:
             self._draw_now(put, state, left_w + 1, 2, right_w, body_h - 2)
         footer = fg("dim") + FOOTER + RESET
@@ -363,6 +406,8 @@ class Renderer:
         items = [current] + list(queue)
         total = len(items)
         pos = min(total, 1)
+        # clamp selected to valid range
+        self.selected = max(0, min(self.selected, max(0, total - 1)))
         put(2, 2, fg("dim") + f"< Library  {pos}/{max(total,1)} · {int(sum(float(i.get('duration') or 0) for i in items))}" + RESET)
         header = "▸ Play Liked Songs"
         put(3, 3, bg("accent") + fg("bg") + pad(header, width - 5) + RESET)
@@ -373,9 +418,32 @@ class Renderer:
             line = crop(title, max(8, width - 10))
             if artist:
                 line = pad(line, width - 10) + fg("dim") + crop(artist, 8) + RESET
-            color = fg("accent") if i == 0 else (fg("dim") if i < self.selected else fg("fg"))
-            put(y, 3, color + crop(line, width - 4) + RESET)
+            if i == 0:
+                color = fg("accent")
+            elif i == self.selected:
+                color = bg("accent") + fg("bg")
+            elif i < self.selected:
+                color = fg("dim")
+            else:
+                color = fg("fg")
+            put(y, 3, color + pad(crop(line, width - 4), width - 4) + RESET)
             y += 1
+
+    def _draw_queue_full(self, put: Any, state: dict[str, Any], x: int, y: int, width: int, height: int) -> None:
+        queue = state.get("queue") or []
+        current = {"title": state.get("title"), "artist": state.get("artist"), "duration": state.get("duration"), "thumb": state.get("thumb"), "id": state.get("id")}
+        items = [current] + list(queue)
+        self.selected = max(0, min(self.selected, max(0, len(items) - 1)))
+        put(y, x, fg("accent") + BOLD + f"Queue — {len(items)} tracks" + RESET)
+        for idx, item in enumerate(items[:height - 2]):
+            title = str(item.get("title") or "Unknown")
+            artist = str(item.get("artist") or "")
+            dur = mmss(item.get("duration"))
+            line = f"{idx+1:>2}. {crop(title, max(10, width - 22))}"
+            if artist:
+                line = pad(line, width - 8) + fg("dim") + crop(artist, 10) + RESET
+            color = bg("accent") + fg("bg") if idx == self.selected else (fg("accent") if idx == 0 else fg("fg"))
+            put(y + 1 + idx, x, color + pad(crop(line, width), width) + fg("dim") + f" {dur}" + RESET)
 
     def _draw_now(self, put: Any, state: dict[str, Any], x: int, y: int, width: int, height: int) -> None:
         art_cells = min(40, max(12, min(width - 8, height - 10)))
@@ -393,14 +461,21 @@ class Renderer:
         fill = int((pos / dur) * bar_w) if dur else 0
         bar = "─" * max(0, fill) + "o" + "─" * max(0, bar_w - fill - 1)
         put(y + art_rows + 4, x + 2, fg("dim") + f"{mmss(pos)} " + fg("accent") + bar + fg("dim") + f" {mmss(dur)}" + RESET)
-        vals = self.spectrum.values()
+        vals, peaks = self.spectrum.values_with_peaks()
         base = y + height - 2
         max_h = max(3, min(8, height // 3))
         start_x = x + max(0, (width - len(vals) * 2) // 2)
         for i, v in enumerate(vals):
             h = max(1, int(v * max_h))
+            peak_h = max(1, int(peaks[i] * max_h)) if i < len(peaks) else h
             for j in range(h):
-                put(base - j, start_x + i * 2, fg("accent") + "█" + RESET)
+                frac = (j + 1) / max_h * 0.6 + (i / max(1, len(vals))) * 0.4
+                put(base - j, start_x + i * 2, _bar_color(frac) + "█" + RESET)
+            # peak-hold dot one above bar if not overlapping
+            if peak_h > h:
+                put(base - peak_h, start_x + i * 2, fg("accent") + "·" + RESET)
+            elif peak_h == h and h < max_h:
+                put(base - peak_h, start_x + i * 2, fg("accent") + "▀" + RESET)
 
     def _draw_lyrics(self, put: Any, state: dict[str, Any], x: int, y: int, width: int, height: int) -> None:
         lines = self.lyrics.visible(float(state.get("position") or 0), height)
@@ -424,14 +499,33 @@ class Renderer:
                 send_command("vol", value=5)
             elif key == "-":
                 send_command("vol", value=-5)
+            elif key == "=":
+                send_command("vol", value=5)
             elif key == "s":
                 send_command("shuffle")
             elif key in ("l", "\t"):
-                self.view = "lyrics" if self.view == "now" else "now"
+                # cycle now -> lyrics -> queue -> now
+                order = ["now", "lyrics", "queue"]
+                idx = order.index(self.view) if self.view in order else 0
+                self.view = order[(idx + 1) % len(order)]
             elif key == "[":
                 self.lyrics.offset -= 0.5
             elif key == "]":
                 self.lyrics.offset += 0.5
+            elif key in ("j", "\x1b[B"):  # down arrow sends CSI B
+                self.selected += 1
+            elif key in ("k", "\x1b[A"):
+                self.selected = max(0, self.selected - 1)
+            elif key in ("\r", "\n"):
+                # enter: play selected (0 is current, skip; else play_index)
+                if self.selected > 0:
+                    send_command("play_index", arg=self.selected - 1)
+                else:
+                    send_command("skip")
+            elif key == "d":
+                if self.selected > 0:
+                    send_command("del", arg=self.selected - 1)
+                    self.selected = max(0, self.selected - 1)
         except Exception as exc:
             self.toast = str(exc)
         return True
@@ -462,17 +556,33 @@ def run(state_path: Path = STATE_PATH, out: IO[str] = sys.stdout) -> int:
                 events = sel.select(deadline - time.time())
                 if events:
                     key = sys.stdin.read(1)
+                    # handle escape sequences (arrows) as composite
+                    if key == "\x1b":
+                        # peek briefly for CSI
+                        sel2 = selectors.DefaultSelector()
+                        sel2.register(sys.stdin, selectors.EVENT_READ)
+                        if sel2.select(0.05):
+                            seq = sys.stdin.read(2)
+                            key = key + seq
+                        sel2.close()
                     if key == "/":
                         out.write("\x1b[2K\rsearch: ")
                         out.flush()
                         termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
                         query = sys.stdin.readline().strip()
                         tty.setcbreak(sys.stdin.fileno())
-                        try:
-                            resp = send_command("search", arg=query)
-                            renderer.toast = resp.get("error") or f"queued: {query}"
-                        except Exception as exc:
-                            renderer.toast = str(exc)
+                        if query:
+                            try:
+                                resp = send_command("search", arg=query)
+                                if resp.get("ok"):
+                                    queued = resp.get("queued")
+                                    renderer.toast = f"queued {queued}" if queued is not None else f"queued: {query}"
+                                else:
+                                    renderer.toast = resp.get("error") or "search failed"
+                            except Exception as exc:
+                                renderer.toast = str(exc)
+                        else:
+                            renderer.toast = ""
                     else:
                         running = renderer.handle_key(key)
             if not interactive:

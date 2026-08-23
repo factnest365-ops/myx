@@ -98,6 +98,8 @@ def queue_search(query: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     check_bins()
+    # if daemon already running and a seed url was given, append it instead of ignoring
+    already = daemon_running()
     proc = boot_daemon(args.url)
     if proc:
         atexit.register(cleanup, proc)
@@ -106,6 +108,11 @@ def main(argv: list[str] | None = None) -> int:
         deadline = time.time() + 3
         while time.time() < deadline and not CMD_SOCK.exists() and proc.poll() is None:
             time.sleep(0.05)
+    elif already and args.url:
+        try:
+            tui.send_command("load", arg=args.url)
+        except Exception as exc:
+            print(f"could not queue seed: {exc}", file=sys.stderr)
     if args.search:
         try:
             queue_search(args.search)

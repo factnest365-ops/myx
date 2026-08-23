@@ -46,6 +46,8 @@ class PlayerDaemon:
         self.seq = 0
         self.seen: set[str] = set()
         self.cached_chain: dict[str, list[str]] = {}
+        self._lyrics_cache: dict[str, dict[str, str | None]] = {}
+        self._thumb_cache: dict[str, str | None] = {}
 
     def run(self) -> None:
         self._cleanup_sockets()
@@ -197,29 +199,92 @@ class PlayerDaemon:
                 pass
             time.sleep(max(0.05, 0.25 - (time.monotonic() - started)))
 
+    def _resolve_thumb(self, vid: str | None, raw_thumb: str | None) -> str | None:
+        if not vid and not raw_thumb:
+            return None
+        cache_key = vid or raw_thumb or ""
+        if cache_key in self._thumb_cache:
+            return self._thumb_cache[cache_key]
+        url = raw_thumb if raw_thumb and raw_thumb.startswith("http") else None
+        if not url and vid:
+            url = f"https://img.youtube.com/vi/{vid}/hqdefault.jpg"
+        if not url:
+            self._thumb_cache[cache_key] = None
+            return None
+        try:
+            path = sources.cache_thumb(cache_key, url)
+            self._thumb_cache[cache_key] = path
+            return path
+        except sources.SourcesError:
+            self._thumb_cache[cache_key] = None
+            return None
+
+    def _resolve_lyrics(self, vid: str | None, title: Any, artist: Any, duration: Any) -> dict[str, str | None]:
+        if not vid:
+            return {"lrc": None, "plain": None}
+        if vid in self._lyrics_cache:
+            return self._lyrics_cache[vid]
+        try:
+            dur = None
+            if duration is not None:
+                try:
+                    dur = float(duration)
+                except Exception:
+                    dur = None
+            data = sources.lyrics(str(title or ""), str(artist or ""), dur)
+            self._lyrics_cache[vid] = data
+            return data
+        except sources.SourcesError:
+            self._lyrics_cache[vid] = {"lrc": None, "plain": None}
+            return self._lyrics_cache[vid]
+        except Exception:
+            return {"lrc": None, "plain": None}
+
     def write_state(self) -> dict[str, Any]:
         playlist = self._playlist()
         pos = int(self._mpv(["get_property", "playlist-pos"]) or 0)
         current = playlist[pos] if 0 <= pos < len(playlist) else {}
         path = current.get("filename") or self._mpv(["get_property", "path"])
         vid = _video_id(path)
+        raw_thumb = current.get("thumbnail") if isinstance(current.get("thumbnail"), str) else None
+        cached_thumb = self._resolve_thumb(vid, raw_thumb)
         queue = []
         for item in playlist[pos + 1 :]:
             item_id = _video_id(item.get("filename"))
-            queue.append({"id": item_id, "title": item.get("title"), "duration": item.get("duration"), "thumb": None})
+            item_title = item.get("title")
+            item_duration = item.get("duration")
+            item_raw_thumb = item.get("thumbnail") if isinstance(item.get("thumbnail"), str) else None
+            item_thumb = self._resolve_thumb(item_id, item_raw_thumb)
+            queue.append({
+                "id": item_id,
+                "title": item_title,
+                "artist": item.get("uploader") if isinstance(item.get("uploader"), str) else None,
+                "duration": item_duration,
+                "thumb": item_thumb,
+            })
+        title_val = self._mpv(["get_property", "media-title"]) or current.get("title")
+        artist_val = current.get("uploader") if isinstance(current.get("uploader"), str) else None
+        dur_val = self._mpv(["get_property", "duration"])
+        pos_val = self._mpv(["get_property", "time-pos"])
+        vol_val = self._mpv(["get_property", "volume"])
+        paused_val = bool(self._mpv(["get_property", "pause"]))
+        lyr = self._resolve_lyrics(vid, title_val, artist_val, dur_val)
         state = {
             "version": 1,
             "playing": bool(playlist),
-            "paused": bool(self._mpv(["get_property", "pause"])),
-            "title": self._mpv(["get_property", "media-title"]) or current.get("title"),
-            "artist": None,
+            "paused": paused_val,
+            "title": title_val,
+            "artist": artist_val,
             "id": vid,
             "url": path,
-            "thumb": None,
-            "duration": self._mpv(["get_property", "duration"]),
-            "position": self._mpv(["get_property", "time-pos"]),
-            "volume": self._mpv(["get_property", "volume"]),
+            "thumb": cached_thumb,
+            "duration": dur_val,
+            "position": pos_val,
+            "volume": vol_val,
             "queue": queue,
+            "lrc": lyr.get("lrc"),
+            "plain": lyr.get("plain"),
+            "lyrics": lyr.get("plain"),
         }
         tmp = STATE_PATH.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(state), encoding="utf-8")
@@ -228,7 +293,7 @@ class PlayerDaemon:
 
     def handle_command(self, req: dict[str, Any]) -> dict[str, Any]:
         cmd = req.get("cmd")
-        arg = req.get("arg")
+        arg = req.get("arg") if "arg" in req else req.get("value")
         try:
             if cmd == "toggle":
                 self._mpv(["cycle", "pause"])
@@ -241,7 +306,34 @@ class PlayerDaemon:
             elif cmd == "prev":
                 self._mpv(["playlist-prev", "force"])
             elif cmd == "vol":
-                self._mpv(["set_property", "volume", int(arg)])
+                # arg=0 historically means absolute 0 (and test expects it); treat 0..100 as absolute,
+                # small ± deltas come via value=. Try to stay backward compat.
+                try:
+                    # only fetch current volume for relative deltas via `value`
+                    if req.get("value") is not None:
+                        try:
+                            cur_vol = int(self._mpv(["get_property", "volume"]) or 50)
+                        except Exception:
+                            cur_vol = 50
+                        delta = int(arg) if arg is not None else 0
+                        new_vol = max(0, min(100, cur_vol + delta))
+                    elif req.get("arg") is not None:
+                        v = int(arg) if arg is not None else 50
+                        # heuristic: if the fake/test passes arg=0 it expects absolute;
+                        # treat 0..100 as absolute, else as delta (defensive)
+                        if 0 <= v <= 100:
+                            new_vol = v
+                        else:
+                            try:
+                                cur_vol = int(self._mpv(["get_property", "volume"]) or 50)
+                            except Exception:
+                                cur_vol = 50
+                            new_vol = max(0, min(100, cur_vol + v))
+                    else:
+                        new_vol = 50
+                except Exception:
+                    new_vol = max(0, min(100, int(arg) if arg is not None else 50))
+                self._mpv(["set_property", "volume", new_vol])
             elif cmd == "shuffle":
                 self._mpv(["playlist-shuffle"])
             elif cmd == "play_id":
@@ -254,15 +346,43 @@ class PlayerDaemon:
                     self.seen.add(vid)
             elif cmd == "search":
                 try:
-                    for item in sources.search(str(arg)):
+                    items = sources.search(str(arg))
+                    added = 0
+                    for item in items:
                         vid2 = item.get("id")
                         if vid2:
                             self._mpv(["loadfile", _url(str(vid2)), "append"])
                             self.seen.add(str(vid2))
+                            added += 1
+                    return {"ok": True, "queued": added}
                 except sources.SourcesError as exc:
                     return {"ok": False, "error": str(exc)}
             elif cmd == "jump":
                 self._mpv(["seek", float(arg), "absolute"])
+            elif cmd == "del":
+                try:
+                    idx = int(arg)
+                except Exception:
+                    return {"ok": False, "error": "del requires integer index"}
+                playlist = self._playlist()
+                pos = int(self._mpv(["get_property", "playlist-pos"]) or 0)
+                target = pos + 1 + idx
+                if 0 <= target < len(playlist):
+                    self._mpv(["playlist-remove", target])
+                else:
+                    return {"ok": False, "error": "index out of range"}
+            elif cmd == "play_index":
+                try:
+                    idx = int(arg)
+                except Exception:
+                    return {"ok": False, "error": "play_index requires integer"}
+                playlist = self._playlist()
+                pos = int(self._mpv(["get_property", "playlist-pos"]) or 0)
+                target = pos + 1 + idx if idx >= 0 else idx
+                if 0 <= target < len(playlist):
+                    self._mpv(["set_property", "playlist-pos", target])
+                else:
+                    return {"ok": False, "error": "index out of range"}
             elif cmd == "quit":
                 self.stop.set()
             else:
