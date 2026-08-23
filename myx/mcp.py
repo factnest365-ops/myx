@@ -10,6 +10,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from tempfile import gettempdir
@@ -26,36 +27,65 @@ except Exception:
 STATE_PATH = Path(os.environ.get("MYX_STATE", PLAYER_STATE_PATH))
 CMD_SOCK = Path(os.environ.get("MYX_CMD_SOCK", PLAYER_CMD_SOCK))
 
+# Candidate fallback paths — handles jcode TMPDIR override vs user shell /tmp
+_FALLBACK_TMPDIRS = [Path("/tmp"), Path(tempfile.gettempdir()), Path("/Users/bhavy/.jcode/scratch")]
+
+def _candidate_states() -> list[Path]:
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for p in [STATE_PATH, PLAYER_STATE_PATH] + [d / "myx-state.json" for d in _FALLBACK_TMPDIRS]:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+def _candidate_cmd_socks() -> list[Path]:
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for p in [CMD_SOCK, PLAYER_CMD_SOCK] + [d / "myx-cmd.sock" for d in _FALLBACK_TMPDIRS]:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
 SERVER_NAME = "myx"
 SERVER_VERSION = "0.2.0"
 
 
 def _send_cmd(cmd: str, **payload: Any) -> dict[str, Any]:
     msg = {"cmd": cmd, **payload}
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.settimeout(2.0)
-        s.connect(str(CMD_SOCK))
-        s.sendall((json.dumps(msg) + "\n").encode())
-        data = b""
-        s.settimeout(2.0)
-        while True:
-            chunk = s.recv(4096)
-            if not chunk:
-                break
-            data += chunk
-            if b"\n" in data:
-                break
-    line = data.decode(errors="ignore").strip().splitlines()[0] if data else "{}"
-    return json.loads(line or "{}")
+    last_err: Exception | None = None
+    for sock_path in _candidate_cmd_socks():
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(2.0)
+                s.connect(str(sock_path))
+                s.sendall((json.dumps(msg) + "\n").encode())
+                data = b""
+                s.settimeout(2.0)
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                    if b"\n" in data:
+                        break
+            line = data.decode(errors="ignore").strip().splitlines()[0] if data else "{}"
+            return json.loads(line or "{}")
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"myx daemon not reachable (tried {', '.join(str(p) for p in _candidate_cmd_socks())}): {last_err}")
 
 
 def _read_state() -> dict[str, Any]:
-    try:
-        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {"playing": False, "paused": True, "title": None, "artist": None, "queue": []}
-    except Exception as e:
-        return {"error": str(e), "playing": False}
+    for p in _candidate_states():
+        try:
+            if p.exists():
+                return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+    return {"playing": False, "paused": True, "title": None, "artist": None, "queue": []}
 
 
 def _spotify_search(q: str) -> list[dict[str, Any]]:
@@ -174,21 +204,39 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             url = str(args.get("url", "")).strip()
             if not url:
                 return _tool_error("url required")
-            # try daemon; if not running, boot it
+            # extract video id for play_id (replace), fallback to load for non-yt urls
+            vid = None
+            import re as _re
+            for pat in (r"[?&]v=([^&]+)", r"youtu\.be/([^?&/]+)"):
+                m = _re.search(pat, url)
+                if m:
+                    vid = m.group(1)
+                    break
+            if _re.fullmatch(r"[A-Za-z0-9_-]{6,}", url):
+                vid = url
             try:
-                resp = _send_cmd("load", arg=url)
+                if vid:
+                    resp = _send_cmd("play_id", arg=vid)
+                else:
+                    resp = _send_cmd("load", arg=url)
+                    if resp.get("ok"):
+                        # for non-id urls, jump to it — need to find queue index
+                        st0 = _read_state()
+                        qlen = len(st0.get("queue") or [])
+                        if qlen:
+                            _send_cmd("play_index", arg=qlen - 1)
+                            resp = {"ok": True}
                 if resp.get("ok"):
-                    # also jump to it if desired? For now append + jump
+                    time.sleep(0.35)
                     st = _read_state()
-                    # find index of newly added if possible — just return ok
-                    return _tool_result({"ok": True, "queued": url, "state": st})
-                # if daemon not reachable, try booting via CLI helper
+                    return _tool_result({"ok": True, "playing": st.get("title"), "id": st.get("id"), "state": st})
                 raise RuntimeError(resp.get("error", "daemon not reachable"))
             except Exception:
                 # boot daemon as subprocess (fire-and-forget)
                 subprocess.Popen([sys.executable, "-m", "myx.player", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                time.sleep(0.5)
-                return _tool_result({"ok": True, "booted": True, "url": url})
+                time.sleep(0.8)
+                st = _read_state()
+                return _tool_result({"ok": True, "booted": True, "url": url, "state": st})
 
         elif name == "myx_search":
             q = str(args.get("query", "")).strip()

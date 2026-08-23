@@ -50,7 +50,33 @@ class PlayerDaemon:
         self._thumb_cache: dict[str, str | None] = {}
 
     def run(self) -> None:
+        # Singleton guard: if lock exists and daemon responds, delegate play and exit
+        try:
+            _existing_lock = Path(tempfile.gettempdir()) / "myx.lock"
+            if _existing_lock.exists():
+                # probe existing daemon — if it answers, we're duplicate
+                probe = Path(tempfile.gettempdir()) / "myx-cmd.sock"
+                # also check jcode scratch mirror
+                for p in [probe, Path("/Users/bhavy/.jcode/scratch") / "myx-cmd.sock"]:
+                    if p.exists():
+                        try:
+                            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                                s.settimeout(0.6)
+                                s.connect(str(p))
+                                s.sendall((json.dumps({"cmd": "play_id", "arg": _video_id(self.url) or self.url}) + "\n").encode())
+                                s.recv(1024)
+                            print(f"delegated to existing daemon at {p}", file=sys.stderr)
+                            return
+                        except Exception:
+                            pass
+        except Exception:
+            pass
         self._cleanup_sockets()
+        # also kill any orphan mpv from stale TMPDIR
+        try:
+            subprocess.run(["pkill", "-f", "myx-mpv.sock"], capture_output=True, timeout=2)
+        except Exception:
+            pass
         self._spawn_mpv()
         self._wait_for_socket(MPV_SOCK)
         self._mpv(["loadfile", self.url, "replace"])
