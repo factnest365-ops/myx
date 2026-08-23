@@ -336,6 +336,18 @@ class PlayerDaemon:
                     self._restart_mpv()
                 except Exception as exc2:
                     print(f"[myx] mpv restart failed: {exc2}", file=sys.stderr)
+                continue
+            # EOF watchdog: track ended but mpv stalled instead of advancing
+            try:
+                core_idle = bool(self._mpv(["get_property", "core-idle"]))
+                paused_now = bool(self._mpv(["get_property", "pause"]))
+                if core_idle and not paused_now:
+                    pl = self._playlist()
+                    if len(pl) > 1:
+                        print("[myx] eof watchdog: kicking stalled track", file=sys.stderr)
+                        self._mpv(["playlist-next", "force"])
+            except Exception:
+                pass
 
     def _resolve_thumb(self, vid: str | None, raw_thumb: str | None) -> str | None:
         if not vid and not raw_thumb:
