@@ -49,30 +49,54 @@ class PlayerDaemon:
         self._lyrics_cache: dict[str, dict[str, str | None]] = {}
         self._thumb_cache: dict[str, str | None] = {}
 
-    def run(self) -> None:
-        # Singleton guard: if lock exists and daemon responds, delegate play and exit
+        self._queue_meta_cache: dict[str, dict[str, Any]] = {}
+
+    def _candidate_cmd_socks(self) -> list[Path]:
+        seen: set[Path] = set()
+        out: list[Path] = []
+        fallback_tmpdirs = [Path("/tmp"), Path(tempfile.gettempdir()), Path("/Users/bhavy/.jcode/scratch")]
+        for p in [CMD_SOCK] + [d / "myx-cmd.sock" for d in fallback_tmpdirs]:
+            if p not in seen:
+                seen.add(p)
+                out.append(p)
+        return out
+
+    def _acquire_singleton(self, url: str) -> bool:
+        lock_path = TMPDIR / "myx.lock"
         try:
-            _existing_lock = Path(tempfile.gettempdir()) / "myx.lock"
-            if _existing_lock.exists():
-                # probe existing daemon — if it answers, we're duplicate
-                probe = Path(tempfile.gettempdir()) / "myx-cmd.sock"
-                # also check jcode scratch mirror
-                for p in [probe, Path("/Users/bhavy/.jcode/scratch") / "myx-cmd.sock"]:
-                    if p.exists():
-                        try:
-                            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-                                s.settimeout(0.6)
-                                s.connect(str(p))
-                                s.sendall((json.dumps({"cmd": "play_id", "arg": _video_id(self.url) or self.url}) + "\n").encode())
-                                s.recv(1024)
-                            print(f"delegated to existing daemon at {p}", file=sys.stderr)
-                            return
-                        except Exception:
-                            pass
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, str(os.getpid()).encode())
+            finally:
+                os.close(fd)
+            return True
+        except FileExistsError:
+            pass
+        except Exception:
+            return True
+
+        vid = _video_id(url) or url
+        for sock_path in self._candidate_cmd_socks():
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                    s.settimeout(0.6)
+                    s.connect(str(sock_path))
+                    s.sendall((json.dumps({"cmd": "play_id", "arg": vid}) + "\n").encode())
+                    s.recv(1024)
+                print(f"delegated to existing daemon at {sock_path}", file=sys.stderr)
+                return False
+            except Exception:
+                pass
+        try:
+            lock_path.unlink()
         except Exception:
             pass
+        return True
+
+    def run(self) -> None:
+        if not self._acquire_singleton(self.url):
+            return
         self._cleanup_sockets()
-        # also kill any orphan mpv from stale TMPDIR
         try:
             subprocess.run(["pkill", "-f", "myx-mpv.sock"], capture_output=True, timeout=2)
         except Exception:
@@ -87,6 +111,8 @@ class PlayerDaemon:
             threading.Thread(target=self._command_server, daemon=True),
             threading.Thread(target=self._refill_loop, daemon=True),
             threading.Thread(target=self._state_loop, daemon=True),
+            threading.Thread(target=self._queue_hydration_loop, daemon=True),
+            threading.Thread(target=self._healthcheck_loop, daemon=True),
         ]
         for t in threads:
             t.start()
@@ -111,6 +137,10 @@ class PlayerDaemon:
             except subprocess.TimeoutExpired:
                 self.mpv.kill()
         self._cleanup_sockets()
+        try:
+            (TMPDIR / "myx.lock").unlink()
+        except Exception:
+            pass
 
     def _spawn_mpv(self) -> None:
         self.mpv = subprocess.Popen([
@@ -225,6 +255,74 @@ class PlayerDaemon:
                 pass
             time.sleep(max(0.05, 0.25 - (time.monotonic() - started)))
 
+    def _queue_hydration_loop(self) -> None:
+        while not self.stop.is_set():
+            try:
+                playlist = self._playlist()
+                pos = int(self._mpv(["get_property", "playlist-pos"]) or 0)
+                for idx in range(pos + 1, len(playlist)):
+                    item = playlist[idx]
+                    item_id = _video_id(item.get("filename"))
+                    if not item_id:
+                        continue
+                    if item_id in self._queue_meta_cache:
+                        continue
+                    if item.get("title"):
+                        self._queue_meta_cache[item_id] = {
+                            "title": item.get("title"),
+                            "artist": item.get("uploader") if isinstance(item.get("uploader"), str) else None,
+                            "duration": item.get("duration"),
+                            "thumb": item.get("thumbnail") if isinstance(item.get("thumbnail"), str) else None,
+                        }
+                        continue
+                    try:
+                        meta = sources.meta(item_id)
+                        self._queue_meta_cache[item_id] = meta
+                    except sources.SourcesError:
+                        self._queue_meta_cache[item_id] = {}
+            except Exception:
+                pass
+            time.sleep(5)
+
+    def _restart_mpv(self) -> None:
+        if self.mpv and self.mpv.poll() is None:
+            try:
+                self.mpv.terminate()
+                self.mpv.wait(timeout=5)
+            except Exception:
+                try:
+                    self.mpv.kill()
+                except Exception:
+                    pass
+        self.mpv = None
+        self._spawn_mpv()
+        self._wait_for_socket(MPV_SOCK)
+        try:
+            current_path = self._mpv(["get_property", "path"])
+            if current_path:
+                self._mpv(["loadfile", current_path, "replace"])
+        except Exception:
+            self._mpv(["loadfile", self.url, "replace"])
+        self.cached_chain.clear()
+        try:
+            self._append_related()
+        except Exception:
+            pass
+
+    def _healthcheck_loop(self) -> None:
+        while not self.stop.is_set():
+            time.sleep(5)
+            if self.stop.is_set():
+                break
+            try:
+                self._mpv(["get_property", "playback-time"])
+            except Exception as exc:
+                print(f"[myx] mpv healthcheck failed: {exc}, restarting", file=sys.stderr)
+                try:
+                    self._restart_mpv()
+                except Exception as exc2:
+                    print(f"[myx] mpv restart failed: {exc2}", file=sys.stderr)
+
     def _resolve_thumb(self, vid: str | None, raw_thumb: str | None) -> str | None:
         if not vid and not raw_thumb:
             return None
@@ -280,11 +378,18 @@ class PlayerDaemon:
             item_title = item.get("title")
             item_duration = item.get("duration")
             item_raw_thumb = item.get("thumbnail") if isinstance(item.get("thumbnail"), str) else None
+            cached_meta = self._queue_meta_cache.get(item_id, {}) if item_id else {}
+            item_title = item_title or cached_meta.get("title")
+            item_artist = item.get("uploader") if isinstance(item.get("uploader"), str) else cached_meta.get("artist")
+            if not isinstance(item_artist, str):
+                item_artist = None
+            item_duration = item_duration or cached_meta.get("duration")
+            item_raw_thumb = item_raw_thumb or cached_meta.get("thumb")
             item_thumb = self._resolve_thumb(item_id, item_raw_thumb)
             queue.append({
                 "id": item_id,
                 "title": item_title,
-                "artist": item.get("uploader") if isinstance(item.get("uploader"), str) else None,
+                "artist": item_artist,
                 "duration": item_duration,
                 "thumb": item_thumb,
             })
@@ -363,8 +468,21 @@ class PlayerDaemon:
             elif cmd == "shuffle":
                 self._mpv(["playlist-shuffle"])
             elif cmd == "play_id":
-                self._mpv(["loadfile", _url(str(arg)), "replace"])
-                self.seen.add(str(arg))
+                vid = str(arg)
+                self._mpv(["loadfile", _url(vid), "replace"])
+                self.seen.add(vid)
+                self.cached_chain.clear()
+                try:
+                    playlist = self._playlist()
+                    pos = int(self._mpv(["get_property", "playlist-pos"]) or 0)
+                    for idx in range(len(playlist) - 1, pos, -1):
+                        self._mpv(["playlist-remove", idx])
+                except Exception:
+                    pass
+                try:
+                    self._append_related()
+                except Exception:
+                    pass
             elif cmd == "load":
                 self._mpv(["loadfile", str(arg), "append"])
                 vid = _video_id(str(arg))
@@ -418,27 +536,60 @@ class PlayerDaemon:
             return {"ok": False, "error": str(exc)}
 
     def _command_server(self) -> None:
-        try:
-            CMD_SOCK.unlink()
-        except FileNotFoundError:
-            pass
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
-            server.bind(str(CMD_SOCK))
-            server.listen(8)
-            server.settimeout(0.25)
-            while not self.stop.is_set():
-                try:
-                    conn, _ = server.accept()
-                except socket.timeout:
-                    continue
-                with conn:
-                    for line in conn.makefile("r", encoding="utf-8"):
-                        try:
-                            req = json.loads(line)
-                            resp = self.handle_command(req)
-                        except Exception as exc:
-                            resp = {"ok": False, "error": str(exc)}
-                        conn.sendall((json.dumps(resp) + "\n").encode())
+        backoff = 1
+        while not self.stop.is_set():
+            server = None
+            try:
+                for sock_path in self._candidate_cmd_socks():
+                    try:
+                        sock_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                bound = False
+                for sock_path in self._candidate_cmd_socks():
+                    try:
+                        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        server.bind(str(sock_path))
+                        server.listen(8)
+                        server.settimeout(0.25)
+                        bound = True
+                        break
+                    except OSError:
+                        if server:
+                            server.close()
+                        server = None
+                if not bound:
+                    raise OSError("failed to bind command socket on any candidate path")
+                backoff = 1
+                while not self.stop.is_set():
+                    try:
+                        conn, _ = server.accept()
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                    try:
+                        with conn:
+                            for line in conn.makefile("r", encoding="utf-8"):
+                                try:
+                                    req = json.loads(line)
+                                    resp = self.handle_command(req)
+                                except Exception as exc:
+                                    resp = {"ok": False, "error": str(exc)}
+                                try:
+                                    conn.sendall((json.dumps(resp) + "\n").encode())
+                                except Exception:
+                                    break
+                    except Exception as exc:
+                        print(f"[myx] command client error: {exc}", file=sys.stderr)
+            except Exception as exc:
+                print(f"[myx] command server error: {exc}, retrying in {backoff}s", file=sys.stderr)
+                time.sleep(backoff)
+                backoff = min(30, backoff * 2)
+            finally:
+                if server:
+                    server.close()
 
 
 def main(argv: list[str] | None = None) -> int:
