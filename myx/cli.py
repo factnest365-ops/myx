@@ -32,6 +32,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("url", nargs="?", help="YouTube or YT Music URL/video id seed")
     parser.add_argument("--search", help="Open search results into the queue")
     parser.add_argument("--lyrics-only", action="store_true", help="Developer aid: start in lyrics view")
+    parser.add_argument("--state", action="store_true", help="Print current player state as JSON and exit (agent-friendly)")
+    sub = parser.add_subparsers(dest="subcommand")
+    mcp_p = sub.add_parser("mcp", help="Run MYX as an MCP server over stdio (for agents)")
+    mcp_p.add_argument("--stdio", action="store_true", help="Use stdio transport (default)")
     return parser.parse_args(argv)
 
 
@@ -101,6 +105,20 @@ def queue_search(query: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    # Agent-native entrypoints — no bin checks, no TUI needed
+    if getattr(args, "subcommand", None) == "mcp":
+        from .mcp import serve_stdio
+        return serve_stdio()
+    if getattr(args, "state", False):
+        import json as _json
+        from pathlib import Path as _Path
+        from tempfile import gettempdir as _gettmp
+        p = _Path(gettempdir()) / "myx-state.json"
+        try:
+            print(_Path(p).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            print(_json.dumps({"playing": False, "paused": True, "queue": []}))
+        return 0
     check_bins()
     # if daemon already running and a seed url was given, append it instead of ignoring
     already = daemon_running()

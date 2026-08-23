@@ -1,7 +1,7 @@
 [project]
 name = "myx"
-version = "0.1.0"
-description = "Terminal music player for YouTube/YT Music radio"
+version = "0.2.0"
+description = "Terminal music player for YouTube/YT Music radio — agent-native (MCP) + TUI"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

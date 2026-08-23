@@ -75,7 +75,30 @@ err = "#ff4444"
 - `myx/sources.py` — pure functions over `yt-dlp` JSON + `lrclib` (`search`, `mix_chain`, `meta`, `cache_thumb`, `lyrics`; 20 s timeout; `SourcesError`).
 - `myx/player.py` — `PlayerDaemon` (`python -m myx.player <url>`): spawns `mpv --input-ipc-server=$TMPDIR/myx-mpv.sock --idle=yes --no-video --ytdl-format=bestaudio`, JSON IPC, refill loop, atomic `$TMPDIR/myx-state.json` at ≥ 4 Hz, command server on `$TMPDIR/myx-cmd.sock` (JSON per line).
 - `myx/tui.py` — alt-screen 12 fps renderer: reads state file, writes command socket, owns zero playback logic.
-- `myx/cli.py` — entrypoint, single-instance lockfile, bin checks, `--search` / `--lyrics-only`.
+- `myx/mcp.py` — stdio MCP server (JSON-RPC 2.0, no deps): exposes 14 tools over stdio by wrapping the same daemon IPC + `myx-state.json`. Agent-native, TUI-optional.
+- `myx/cli.py` — entrypoint, single-instance lockfile, bin checks, `--search` / `--lyrics-only`, plus agent-friendly `myx --state` and `myx mcp`.
+
+## Agent-native (MCP)
+
+MYX is built agent-first: the TUI is a view, the daemon is the API. Agents don't need the TUI at all.
+
+```sh
+myx --state              # pollable JSON — title/artist/position/queue/lyrics
+myx mcp --stdio          # stdio MCP server — 14 tools
+myx "https://..."        # still works headless — mpv + yt-dlp, no TUI needed
+```
+
+### Connecting to jcode (or any MCP client)
+
+Add to `~/.jcode/mcp.json` (jcode already has MYX installed):
+
+```json
+{ "servers": { "myx": { "command": "/Users/bhavy/myx/.venv/bin/python", "args": ["-m", "myx.mcp"], "env": {}, "shared": true } } }
+```
+
+Skill is at `~/.jcode/skills/myx/SKILL.md` — auto-loaded. Any jcode agent can then call `myx_search`, `myx_play`, `myx_state`, etc. Also `myx-skill/SKILL.md` in the MYX repo for sharing.
+
+**MCP tools:** `myx_play(url)` · `myx_search(query)` · `myx_state` · `myx_queue` · `myx_skip`/`myx_prev` · `myx_pause`/`myx_resume`/`myx_toggle` · `myx_volume(volume|delta)` · `myx_shuffle` · `myx_lyrics` · `myx_remove(index)` · `myx_play_index(index)` — all backed by the daemon's `myx-cmd.sock` + `myx-state.json`; none touch the TUI.
 
 ## Dev
 
