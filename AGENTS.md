@@ -3,10 +3,12 @@
 Free-stack only: Python + mpv (playback/IPC) + yt-dlp (streams, search, metadata). No API keys, no accounts, no paid services. Reference look: orange-on-black TUI, queue sidebar left, huge centered album art, live spectrum below, synced-lyrics view, keybind footer.
 
 ## Run targets
-- `myx "<youtube-or-ytmusic-url>"` starts radio: plays seed, refills forever via RD-chain (port logic from ~/bin/ytradio: dedupe seen-set learned from appends, eager first fill, keep buffer >= 2, fallback repeat when chain cached).
+- `myx "<youtube-or-ytmusic-url>"` starts radio: plays seed, refills forever via RD-chain (dedupe seen-set, eager first fill, keep buffer >= 2, fallback repeat when chain cached).
 - `myx --search "query"` opens search results into queue.
+- `myx mcp --stdio` runs as an MCP server over stdio (agent-native).
+- `myx --state` prints current player state as JSON and exits (agent-friendly).
 
-## Architecture (3 modules, fixed contracts)
+## Architecture (4 modules, fixed contracts)
 
 ### myx/sources.py - yt-dlp + lyrics wrappers (pure functions)
 - `search(q) -> [{id,title,artist,duration,thumb}]` via yt-dlp `ytsearch20` json.
@@ -22,6 +24,25 @@ Free-stack only: Python + mpv (playback/IPC) + yt-dlp (streams, search, metadata
 - Refill loop thread: when queue <= 2, mix_chain(current) -> filter seen-set -> loadfile append each; mark_seen on successful append; eager fill at start; retry/backoff on yt-dlp failure; never let mpv go idle while tracks exist.
 - State out: writes atomically every tick (>=4 Hz while playing) to `$TMPDIR/myx-state.json`: `{version, playing(bool), paused, title, artist, id, url, thumb(path|None), duration, position, volume, queue:[{id,title,duration,thumb}]}`.
 - Command server: listen `$TMPDIR/myx-cmd.sock`, one JSON cmd per line, reply `{"ok":true}` or `{"ok":false,"error":"..."}`.
+- Singleton lockfile at `$TMPDIR/myx.lock`; healthcheck loop restarts mpv on death/unresponsiveness; EOF watchdog kicks stalled tracks.
+
+### myx/mcp.py - MCP server (stdio JSON-RPC 2.0, no external deps)
+- Exposes 14 tools over stdio by wrapping the daemon IPC + reading `$TMPDIR/myx-state.json`. Does not own playback.
+- Server identity: `myx` v0.2.0, protocol `2024-11-05`.
+- Tools:
+  - `myx_play(url)` — play a YouTube URL or video id; boots daemon if not running; falls back to direct mpv.
+  - `myx_search(query)` — ytsearch20, enqueues all results; if daemon unreachable, returns results without enqueueing.
+  - `myx_state` — current player state (playing/paused, title/artist, position/duration, volume, queue, lyrics).
+  - `myx_queue` — upcoming tracks + current.
+  - `myx_skip` / `myx_prev` — playlist-next / playlist-prev.
+  - `myx_pause` / `myx_resume` / `myx_toggle` — pause control.
+  - `myx_volume(volume|delta)` — absolute 0..100 or relative ±N.
+  - `myx_shuffle` — shuffle queue.
+  - `myx_lyrics` — `{lrc, plain, title, artist}` for current track.
+  - `myx_remove(index)` — remove queue item by index.
+  - `myx_play_index(index)` — jump to queue item by index.
+- IPC: sends JSON cmds to `$TMPDIR/myx-cmd.sock`; reads state from `$TMPDIR/myx-state.json`; falls back across candidate tmpdirs.
+- Entry: `myx mcp --stdio` (cli.py routes here); direct: `python -m myx.mcp`.
 
 ### myx/tui.py - renderer (reads state file, writes cmd socket; owns zero playback logic)
 - Raw mode, alt screen, ~12 fps loop. Stdlib termios/tty; ANSI escapes only.
@@ -35,12 +56,13 @@ Free-stack only: Python + mpv (playback/IPC) + yt-dlp (streams, search, metadata
 - Theme dict: bg #0d0d0d fg #e8e3d8 accent #ff6b35 dim #7a756c err #ff4444. Optional override `~/.config/myx/config.toml`.
 
 ### myx/cli.py - entrypoint
-argparse: positional url optional, --search, --lyrics-only flag dev aid. Boots PlayerDaemon subprocess if not running (single-instance lockfile), then TUI. On quit: SIGTERM daemon, kill mpv.
+argparse: positional url optional, --search, --lyrics-only flag dev aid, --state for agent JSON, subcommand `mcp` for MCP server. Boots PlayerDaemon subprocess if not running (single-instance lockfile at `$TMPDIR/myx.lock`), then TUI. On quit: SIGTERM daemon, kill mpv, clean lockfile. Bin checks at boot: mpv, yt-dlp, ffmpeg — missing exits with install hint.
 
 ## Rules
-- uv project. deps: numpy, pillow (only if half-block path needs resize convenience; prefer rawvideo+nearest). dev: pytest.
+- uv project. deps: numpy>=2.0.0, pillow>=10.0.0. dev: pytest>=8.0.0. Build: hatchling. Console script: `myx` -> `myx.cli:main`.
 - External bins checked at boot: mpv, yt-dlp, ffmpeg; missing -> one-line install hint, exit 1.
 - No other deps. urllib for lrclib. No network calls in tui.py ever.
-- Tests (pytest, no network, no real mpv): sources JSON-shape fixtures parsed correctly; player state machine against fake socket pair; cmd protocol roundtrip. `uv run pytest` green before any commit.
+- Tests (pytest, no network, no real mpv): sources JSON-shape fixtures parsed correctly; player state machine against fake socket pair; cmd protocol roundtrip; MCP tools list shape and handle_tool paths. `uv run pytest` green before any commit.
 - Conventional commits, commit after each working unit.
 - macOS/bash 3.2 irrelevant here (Python only), but keep everything runnable on macOS arm64 + Linux.
+- License: MIT (Copyright © 2026 Bhavya Singh).

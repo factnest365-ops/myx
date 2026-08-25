@@ -93,7 +93,7 @@ myx "https://..."        # still works headless — mpv + yt-dlp, no TUI needed
 Add to `~/.jcode/mcp.json` (jcode already has MYX installed):
 
 ```json
-{ "servers": { "myx": { "command": "/Users/bhavy/myx/.venv/bin/python", "args": ["-m", "myx.mcp"], "env": {}, "shared": true } } }
+{ "servers": { "myx": { "command": "uv", "args": ["run", "--project", "/path/to/myx", "python", "-m", "myx.mcp"], "env": {}, "shared": true } } }
 ```
 
 Skill is at `~/.jcode/skills/myx/SKILL.md` — auto-loaded. Any jcode agent can then call `myx_search`, `myx_play`, `myx_state`, etc. Also `myx-skill/SKILL.md` in the MYX repo for sharing.
