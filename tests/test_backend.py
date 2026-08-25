@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
+import tempfile
 import threading
+from pathlib import Path
 
 from myx import sources
 from myx.player import PlayerDaemon
@@ -41,10 +44,12 @@ def test_lyrics_404_returns_nones(monkeypatch):
     assert sources.lyrics("nope", "nobody") == {"lrc": None, "plain": None}
 
 
-def test_player_command_protocol_roundtrip(monkeypatch, tmp_path):
+def test_player_command_protocol_roundtrip(monkeypatch):
     import myx.player as player
 
-    sock_path = tmp_path / "cmd.sock"
+    sock_dir = Path(tempfile.gettempdir()) / f"myx-test-{os.getpid()}"
+    sock_dir.mkdir(exist_ok=True)
+    sock_path = sock_dir / "cmd.sock"
     monkeypatch.setattr(player, "CMD_SOCK", sock_path)
     daemon = PlayerDaemon("https://youtube.com/watch?v=seed")
     calls = []
