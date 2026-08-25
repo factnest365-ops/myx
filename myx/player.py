@@ -552,8 +552,7 @@ class PlayerDaemon:
                 self._mpv(["playlist-shuffle"])
             elif cmd == "play_id":
                 vid = str(arg)
-                self._mpv(["loadfile", _url(vid), "replace"])
-                self.seen.add(vid)
+                self._play_now(vid)
                 self.cached_chain.clear()
                 try:
                     playlist = self._playlist()
@@ -578,8 +577,7 @@ class PlayerDaemon:
                     for item in items:
                         vid2 = item.get("id")
                         if vid2:
-                            self._mpv(["loadfile", _url(str(vid2)), "append"])
-                            self.seen.add(str(vid2))
+                            self._append_track(str(vid2), True)
                             added += 1
                     return {"ok": True, "queued": added}
                 except sources.SourcesError as exc:
