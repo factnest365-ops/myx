@@ -31,7 +31,9 @@ CMD_SOCK = Path(os.environ.get("MYX_CMD_SOCK", PLAYER_CMD_SOCK))
 
 
 def _get_fallback_tmpdirs() -> list[Path]:
-    dirs = [Path("/tmp"), Path(tempfile.gettempdir()), Path("/Users/bhavy/.jcode/scratch")]
+    dirs = [Path("/tmp"), Path(tempfile.gettempdir())]
+    if tmp := os.environ.get("MYX_FALLBACK_TMP"):
+        dirs.append(Path(tmp))
     env_tmp = os.environ.get("TMPDIR")
     if env_tmp:
         dirs.append(Path(env_tmp))

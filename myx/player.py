@@ -54,7 +54,9 @@ class PlayerDaemon:
     def _candidate_cmd_socks(self) -> list[Path]:
         seen: set[Path] = set()
         out: list[Path] = []
-        fallback_tmpdirs = [Path("/tmp"), Path(tempfile.gettempdir()), Path("/Users/bhavy/.jcode/scratch")]
+        fallback_tmpdirs = [Path("/tmp"), Path(tempfile.gettempdir())]
+        if tmp := os.environ.get("MYX_FALLBACK_TMP"):
+            fallback_tmpdirs.append(Path(tmp))
         for p in [CMD_SOCK] + [d / "myx-cmd.sock" for d in fallback_tmpdirs]:
             if p not in seen:
                 seen.add(p)
