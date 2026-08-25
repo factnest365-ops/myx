@@ -96,6 +96,16 @@ class PlayerDaemon:
             lock_path.unlink()
         except Exception:
             pass
+        # Re-acquire the lock so a recovered boot doesn't leave an open
+        # window where another instance could start alongside this one.
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, str(os.getpid()).encode())
+            finally:
+                os.close(fd)
+        except Exception:
+            pass  # lost a race with another instance; playback still works
         return True
 
     def run(self) -> None:
@@ -494,6 +504,8 @@ class PlayerDaemon:
         return state
 
     def handle_command(self, req: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(req, dict):
+            return {"ok": False, "error": "request must be a JSON object"}
         cmd = req.get("cmd")
         arg = req.get("arg") if "arg" in req else req.get("value")
         try:

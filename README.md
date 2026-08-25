@@ -100,6 +100,15 @@ Skill is at `~/.jcode/skills/myx/SKILL.md` — auto-loaded. Any jcode agent can 
 
 **MCP tools:** `myx_play(url)` · `myx_search(query)` · `myx_state` · `myx_queue` · `myx_skip`/`myx_prev` · `myx_pause`/`myx_resume`/`myx_toggle` · `myx_volume(volume|delta)` · `myx_shuffle` · `myx_lyrics` · `myx_remove(index)` · `myx_play_index(index)` — all backed by the daemon's `myx-cmd.sock` + `myx-state.json`; none touch the TUI.
 
+## Security & Threat Model
+
+MYX is a **single-user, local-machine** tool. Stated plainly:
+
+- **No auth on IPC.** Any process running as your user can send commands to `$TMPDIR/myx-cmd.sock` and `myx-mpv.sock` (play/pause/skip/search), and read `$TMPDIR/myx-state.json` (current track, queue, lyrics). This is a feature for agents, an exposure for multi-user machines. Don't run MYX on shared hosts.
+- **Network egress only**: yt-dlp talks to YouTube, lyrics fetch to lrclib.net. No inbound listeners, no telemetry.
+- **Supply-chain trust anchor**: stream URLs come from whatever `yt-dlp` resolves. Update it regularly (`brew upgrade yt-dlp`) — YouTube extractor breakage is the #1 failure mode, and MYX surfaces it as `[myx] stream resolve failed (...)` rather than dying silently.
+- **Tmpdir contract**: daemon and clients agree on the state/cmd socket paths via `TMPDIR`. If your MCP client sees a different `TMPDIR` than the daemon (common on macOS), set `MYX_FALLBACK_TMP=/tmp` for both, or rely on the built-in `/tmp` fallback scan.
+
 ## Dev
 
 ```sh
