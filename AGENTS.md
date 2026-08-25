@@ -19,7 +19,7 @@ Free-stack only: Python + mpv (playback/IPC) + yt-dlp (streams, search, metadata
 - All network calls timeout 20s, raise SourcesError(msg) with human text.
 
 ### myx/player.py - PlayerDaemon (runs standalone: `python -m myx.player <url>`)
-- Spawns `mpv --input-ipc-server=$TMPDIR/myx-mpv.sock --idle=yes --no-video --ytdl-format=bestaudio`.
+- Spawns `mpv --input-ipc-server=$TMPDIR/myx-mpv.sock --idle=yes --no-video --no-ytdl`.
 - JSON IPC over that socket (stdlib socket, no python-mpv dep). Commands in: toggle/pause/resume/skip/prev/vol N/shuffle/play_id ID/load URL/jump POS/quit.
 - Refill loop thread: when queue <= 2, mix_chain(current) -> filter seen-set -> loadfile append each; mark_seen on successful append; eager fill at start; retry/backoff on yt-dlp failure; never let mpv go idle while tracks exist.
 - State out: writes atomically every tick (>=4 Hz while playing) to `$TMPDIR/myx-state.json`: `{version, playing(bool), paused, title, artist, id, url, thumb(path|None), duration, position, volume, queue:[{id,title,duration,thumb}]}`.

@@ -50,6 +50,9 @@ class PlayerDaemon:
         self._thumb_cache: dict[str, str | None] = {}
 
         self._queue_meta_cache: dict[str, dict[str, Any]] = {}
+        self._stream_cache: dict[str, str] = {}
+        self._id_by_path: dict[str, str] = {}
+        self._idle_since: float | None = None
 
     def _candidate_cmd_socks(self) -> list[Path]:
         seen: set[Path] = set()
@@ -105,10 +108,11 @@ class PlayerDaemon:
             pass
         self._spawn_mpv()
         self._wait_for_socket(MPV_SOCK)
-        self._mpv(["loadfile", self.url, "replace"])
-        vid = _video_id(self.url)
-        if vid:
-            self.seen.add(vid)
+        seed_vid = _video_id(self.url)
+        if seed_vid:
+            self._play_now(seed_vid)
+        else:
+            self._mpv(["loadfile", self.url, "replace"])
         threads = [
             threading.Thread(target=self._command_server, daemon=True),
             threading.Thread(target=self._refill_loop, daemon=True),
@@ -150,7 +154,7 @@ class PlayerDaemon:
             f"--input-ipc-server={MPV_SOCK}",
             "--idle=yes",
             "--no-video",
-            "--ytdl-format=bestaudio",
+            "--no-ytdl",
             "--no-terminal",
         ], text=True)
 
@@ -196,13 +200,38 @@ class PlayerDaemon:
         return data if isinstance(data, list) else []
 
     def _current_id(self) -> str | None:
-        return _video_id(self._mpv(["get_property", "path"])) or _video_id(self.url)
+        path = self._mpv(["get_property", "path"])
+        return (
+            self._id_by_path.get(path or "")
+            or _video_id(path)
+            or _video_id(self.url)
+        )
 
     def _append_track(self, video_id: str, mark_seen: bool = True) -> bool:
-        self._mpv(["loadfile", _url(video_id), "append"])
+        stream = self._stream_for(video_id)
+        self._mpv(["loadfile", stream, "append"])
+        self._id_by_path[stream] = video_id
         if mark_seen:
             self.seen.add(video_id)
         return True
+
+    def _stream_for(self, video_id: str) -> str:
+        cached = self._stream_cache.get(video_id)
+        if cached:
+            return cached
+        try:
+            url = sources.stream_url(video_id)
+        except sources.SourcesError as exc:
+            print(f"[myx] stream resolve failed ({exc}); delegating to mpv", file=sys.stderr)
+            return _url(video_id)
+        self._stream_cache[video_id] = url
+        return url
+
+    def _play_now(self, video_id: str) -> None:
+        stream = self._stream_for(video_id)
+        self._mpv(["loadfile", stream, "replace"])
+        self._id_by_path[stream] = video_id
+        self.seen.add(video_id)
 
     def _append_related(self) -> bool:
         cur = self._current_id()
@@ -264,7 +293,7 @@ class PlayerDaemon:
                 pos = int(self._mpv(["get_property", "playlist-pos"]) or 0)
                 for idx in range(pos + 1, len(playlist)):
                     item = playlist[idx]
-                    item_id = _video_id(item.get("filename"))
+                    item_id = self._id_by_path.get(item.get("filename") or "") or _video_id(item.get("filename"))
                     if not item_id:
                         continue
                     if item_id in self._queue_meta_cache:
@@ -301,7 +330,10 @@ class PlayerDaemon:
         self._wait_for_socket(MPV_SOCK)
         try:
             current_path = self._mpv(["get_property", "path"])
-            if current_path:
+            cur_id = self._id_by_path.get(current_path or "") or _video_id(current_path)
+            if cur_id:
+                self._play_now(cur_id)
+            elif current_path:
                 self._mpv(["loadfile", current_path, "replace"])
         except Exception:
             self._mpv(["loadfile", self.url, "replace"])
@@ -346,10 +378,21 @@ class PlayerDaemon:
                 if core_idle and not paused_now:
                     pl = self._playlist()
                     if len(pl) > 1:
-                        print("[myx] eof watchdog: kicking stalled track", file=sys.stderr)
-                        self._mpv(["playlist-next", "force"])
+                        # core-idle is also true during resolve/buffer; kick only
+                        # after sustained idle so slow track starts survive.
+                        now = time.monotonic()
+                        if self._idle_since is None:
+                            self._idle_since = now
+                        elif now - self._idle_since > 25:
+                            self._idle_since = None
+                            print("[myx] eof watchdog: kicking stalled track (sustained idle)", file=sys.stderr)
+                            self._mpv(["playlist-next", "force"])
+                    else:
+                        self._idle_since = None
+                else:
+                    self._idle_since = None
             except Exception:
-                pass
+                self._idle_since = None
 
     def _resolve_thumb(self, vid: str | None, raw_thumb: str | None) -> str | None:
         if not vid and not raw_thumb:
@@ -397,12 +440,12 @@ class PlayerDaemon:
         pos = int(self._mpv(["get_property", "playlist-pos"]) or 0)
         current = playlist[pos] if 0 <= pos < len(playlist) else {}
         path = current.get("filename") or self._mpv(["get_property", "path"])
-        vid = _video_id(path)
+        vid = self._id_by_path.get(path or "") or _video_id(path)
         raw_thumb = current.get("thumbnail") if isinstance(current.get("thumbnail"), str) else None
         cached_thumb = self._resolve_thumb(vid, raw_thumb)
         queue = []
         for item in playlist[pos + 1 :]:
-            item_id = _video_id(item.get("filename"))
+            item_id = self._id_by_path.get(item.get("filename") or "") or _video_id(item.get("filename"))
             item_title = item.get("title")
             item_duration = item.get("duration")
             item_raw_thumb = item.get("thumbnail") if isinstance(item.get("thumbnail"), str) else None

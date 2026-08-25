@@ -101,6 +101,23 @@ def meta(video_id: str) -> dict[str, Any]:
     return _shape(data)
 
 
+def stream_url(video_id: str) -> str:
+    """Resolve a direct bestaudio CDN URL (IPv4-forced for reliable streaming)."""
+    out = _run_ytdlp([
+        "--force-ipv4",
+        "--no-warnings",
+        "--get-url",
+        "-f",
+        "bestaudio",
+        f"https://www.youtube.com/watch?v={video_id}",
+    ])
+    for line in reversed(out.splitlines()):
+        line = line.strip()
+        if line.startswith("http"):
+            return line
+    raise SourcesError("yt-dlp returned no stream url")
+
+
 def cache_thumb(url_or_id: str, thumb_url: str) -> str:
     cache = Path.home() / "Library" / "Caches" / "myx" / "thumbs"
     cache.mkdir(parents=True, exist_ok=True)
