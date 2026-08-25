@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install mpv yt-dlp ffmpeg
+          else
+            sudo apt-get update
+            sudo apt-get install -y mpv ffmpeg
+            (command -v yt-dlp || pipx install yt-dlp)
+          fi
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Sync project
+        run: uv sync --dev
+
+      - name: External bins present
+        run: |
+          command -v mpv
+          command -v yt-dlp
+          command -v ffmpeg
+
+      - name: Tests
+        run: uv run pytest -q
