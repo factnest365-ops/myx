@@ -4,6 +4,23 @@ version = "0.2.0"
 description = "Terminal music player for YouTube/YT Music radio — agent-native (MCP) + TUI"
 readme = "README.md"
 requires-python = ">=3.11"
+license = { text = "MIT" }
+keywords = ["music", "youtube", "yt-music", "tui", "mcp", "mpv", "terminal"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Players",
+]
+
+[project.urls]
+Homepage = "https://github.com/factnest365-ops/myx"
+Repository = "https://github.com/factnest365-ops/myx"
+Issues = "https://github.com/factnest365-ops/myx/issues"
 dependencies = [
     "numpy>=2.0.0",
     "pillow>=10.0.0",

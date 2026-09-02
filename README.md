@@ -6,12 +6,66 @@ Orange-on-black TUI, queue sidebar, huge centered album art, live spectrum, sync
 
 ## Install
 
+Pick one — easiest first.
+
+### Option 1 — Homebrew (recommended, macOS / Linux)
+
 ```sh
-brew install mpv yt-dlp ffmpeg
-uv sync          # or: pip install -e .
+brew tap factnest365-ops/myx && brew install myx
 ```
 
-Requires Python ≥ 3.11, `numpy`, `pillow`.
+This installs `myx` plus its system deps (`mpv`, `yt-dlp`, `ffmpeg`) and the Python deps (`numpy`, `pillow`). Then:
+
+```sh
+myx doctor        # check everything is happy
+myx               # launches the app shell — just type to search
+```
+
+> Formula lives at `Formula/myx.rb` in this repo. On release, update `url` + `sha256` in the formula and `brew tap` picks it up.
+
+### Option 2 — pipx / uv tool / pip (any OS with Python ≥ 3.11)
+
+```sh
+# pipx (isolated, recommended for pip users)
+pipx install myx
+# or uv
+uv tool install myx
+# or pip
+pip install myx
+```
+
+Then make sure the system bins are present:
+
+```sh
+myx doctor        # reports mpv / yt-dlp / ffmpeg status
+myx doctor --fix  # tries to auto-fix (brew install/upgrade, stale lock cleanup)
+```
+
+If any bin is missing, install it with your OS package manager:
+
+```sh
+# macOS
+brew install mpv yt-dlp ffmpeg
+# Ubuntu / Debian
+sudo apt-get install mpv ffmpeg && pipx install yt-dlp
+```
+
+### Option 3 — from source (for contributors)
+
+```sh
+git clone https://github.com/factnest365-ops/myx && cd myx
+uv sync --extra dev   # or: pip install -e ".[dev]"
+uv run myx --help
+```
+
+Requires Python ≥ 3.11. Console script is `myx = myx.cli:main` (see `pyproject.toml`).
+
+### First run
+
+1. Install via any option above.
+2. Run `myx` with no args — it opens the app shell with a search picker.
+3. Type a query (e.g. `blinding lights`), hit `enter` — results fill the queue and playback starts. Or seed radio directly: `myx "https://www.youtube.com/watch?v=..."`.
+4. If something looks off, `myx doctor` tells you what to fix.
 
 ## Use
 

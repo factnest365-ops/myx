@@ -66,3 +66,10 @@ argparse: positional url optional, --search, --lyrics-only flag dev aid, --state
 - Conventional commits, commit after each working unit.
 - macOS/bash 3.2 irrelevant here (Python only), but keep everything runnable on macOS arm64 + Linux.
 - License: MIT (Copyright © 2026 Bhavya Singh).
+
+## Maintaining this file
+
+Keep this file for knowledge useful to almost every future agent session in this project.
+Do not repeat what the codebase already shows; point to the authoritative file or command instead.
+Prefer rewriting or pruning existing entries over appending new ones.
+When updating this file, preserve this bar for all agents and keep entries concise.
