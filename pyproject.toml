@@ -17,14 +17,15 @@ classifiers = [
     "Topic :: Multimedia :: Sound/Audio :: Players",
 ]
 
-[project.urls]
-Homepage = "https://github.com/factnest365-ops/myx"
-Repository = "https://github.com/factnest365-ops/myx"
-Issues = "https://github.com/factnest365-ops/myx/issues"
 dependencies = [
     "numpy>=2.0.0",
     "pillow>=10.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/factnest365-ops/myx"
+Repository = "https://github.com/factnest365-ops/myx"
+Issues = "https://github.com/factnest365-ops/myx/issues"
 
 [project.scripts]
 myx = "myx.cli:main"
