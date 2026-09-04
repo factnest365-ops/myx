@@ -21,16 +21,38 @@ import tty
 from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import gettempdir
-from typing import IO, Any
+from typing import IO, Any, Callable
 
 try:  # numpy is allowed for the spectrum tap.
     import numpy as np
 except Exception:  # pragma: no cover - exercised only without project deps
     np = None
 
+try:
+    from .picker import (  # type: ignore
+        COMMAND_PALETTE,
+        KEYBINDS,
+        TOUR_STEPS,
+        PickerState,
+        command_palette_search,
+        format_duration,
+        fuzzy_filter,
+    )
+except Exception:  # fallback for hermetic env without package install
+    from myx.picker import (  # type: ignore
+        COMMAND_PALETTE,
+        KEYBINDS,
+        TOUR_STEPS,
+        PickerState,
+        command_palette_search,
+        format_duration,
+        fuzzy_filter,
+    )
+
 STATE_PATH = Path(os.environ.get("MYX_STATE", Path(gettempdir()) / "myx-state.json"))
 CMD_SOCK = Path(os.environ.get("MYX_CMD_SOCK", Path(gettempdir()) / "myx-cmd.sock"))
-FOOTER = "space pause · n next · p prev · / search · s shuffle · +,- vol · l lyrics · tab view · j,k nav · enter play · d del · q quit"
+FOOTER = "type to search · ? help · q quit · space pause · n next · p prev · s shuffle · +,- vol · l lyrics · enter play"
+CONTROLS_HINT = "[ ▶ Play ] [ ⏸ Pause ] [ ⏭ Next ] [ 🔀 Shuffle ]"
 
 THEME = {
     "bg": "#0d0d0d",
@@ -350,6 +372,90 @@ class Renderer:
     selected: int = 0
     toast: str = ""
     spectrum: SpectrumSource = field(default_factory=SpectrumSource)
+    # --- app-like picker state ---
+    overlay: str | None = None  # None | "search" | "command" | "help"
+    picker: PickerState = field(default_factory=PickerState)
+    command_query: str = ""
+    command_selected: int = 0
+    search_fn: Callable[[str], dict[str, Any]] | None = None
+    _pending_delete_idx: int | None = None
+    _delete_confirm_time: float = 0.0
+    _last_search_fire: float = 0.0
+
+    def _is_empty_state(self, state: dict[str, Any]) -> bool:
+        queue = state.get("queue") or []
+        playing = state.get("playing")
+        title = str(state.get("title") or "")
+        idle_titles = {"MYX", "Waiting for player", "State unavailable", "Unknown", ""}
+        return (not queue and not playing) or title in idle_titles and not queue
+
+    def _maybe_fire_search(self, now: float | None = None) -> None:
+        """Debounced search via daemon (send_command) or injected search_fn."""
+        if self.overlay != "search":
+            return
+        if not self.picker.query.strip():
+            return
+        cur = now if now is not None else time.monotonic()
+        # debounce 250ms
+        if not self.picker.should_search_now(cur):
+            return
+        # avoid re-firing same query
+        if cur - self._last_search_fire < 0.25:
+            return
+        self._last_search_fire = cur
+        q = self.picker.query.strip()
+        self.picker.set_loading(True)
+        try:
+            if self.search_fn is not None:
+                resp = self.search_fn(q)
+            else:
+                resp = send_command("search", arg=q)
+            if isinstance(resp, dict) and resp.get("ok") is False:
+                self.picker.set_error(str(resp.get("error") or "search failed"))
+                # also surface as toast for visibility
+                self.toast = str(resp.get("error") or "search failed")
+            elif isinstance(resp, dict) and "results" in resp:
+                # injected search may return {"results": [...]}
+                results = resp.get("results") or []
+                self.picker.set_results(results if isinstance(results, list) else [])
+                if not self.picker.results:
+                    self.toast = f"No results for '{q}'"
+            elif isinstance(resp, list):
+                self.picker.set_results(resp)
+            else:
+                # daemon search returns {"ok": True, "queued": N} — don't populate picker results,
+                # just toast and clear loading
+                self.picker.set_loading(False)
+                if isinstance(resp, dict) and resp.get("ok"):
+                    queued = resp.get("queued")
+                    if queued is not None:
+                        self.toast = f"queued {queued}"
+                    self.picker.set_results([])
+        except Exception as exc:
+            self.picker.set_error(str(exc))
+            self.toast = str(exc)
+
+    # -- overlay helpers --
+    def open_search(self, initial: str = "") -> None:
+        self.overlay = "search"
+        self.picker.set_query(initial, now=time.monotonic())
+        self._last_search_fire = 0.0
+        self.toast = ""
+
+    def open_command_palette(self) -> None:
+        self.overlay = "command"
+        self.command_query = ""
+        self.command_selected = 0
+        self.toast = ""
+
+    def open_help(self) -> None:
+        self.overlay = "help"
+        self.toast = ""
+
+    def close_overlay(self) -> None:
+        self.overlay = None
+        self.command_query = ""
+        self.command_selected = 0
 
     def render_once(self, state: dict[str, Any] | None = None, size: tuple[int, int] | None = None) -> str:
         state = state or read_state(self.state_path)
@@ -404,11 +510,31 @@ class Renderer:
             self._draw_queue_full(put, state, left_w + 1, 1, right_w, body_h - 1)
         else:
             self._draw_now(put, state, left_w + 1, 1, right_w, body_h - 1)
+
+        # resilience toast: idle state shows updating hint
+        if not self.toast and self._is_empty_state(state):
+            # only show if not already in search overlay (search is the action)
+            if self.overlay != "search":
+                self.toast = "♪  Search to add songs  ·  Updating player... run myx doctor if this persists"
+
+        # bottom controls hint row (above footer) — accent buttons
+        controls = fg("dim") + CONTROLS_HINT + RESET
+        put(rows - 2, max(0, cols - cell_len(strip_ansi(controls)) - 2), controls)
+
         footer = fg("dim") + FOOTER + RESET
         # spec: always full footer visible — write at 0, not centered-clip
         put(rows - 1, 0, footer)
         if self.toast:
             put(rows - 2, 2, fg("accent") + self.toast + RESET)
+
+        # overlays on top
+        if self.overlay == "search":
+            self._draw_search_picker(put, cols, rows)
+        elif self.overlay == "command":
+            self._draw_command_palette(put, cols, rows)
+        elif self.overlay == "help":
+            self._draw_help_overlay(put, cols, rows)
+
         frame = CLEAR + HIDE + "\n".join(canvas)
         self.out.write(frame)
         self.out.flush()
@@ -427,7 +553,20 @@ class Renderer:
         put(2, 2, bg("accent") + fg("bg") + " " + pad(header, width - 4) + " " + RESET)
         y = 3
         avail = max(0, height - 4)
+        # empty queue illustration centered
+        if not queue and self._is_empty_state(state):
+            # show centered illustration hint inside left panel below header
+            hint = "♪  Search above to add songs"
+            put(y + avail // 2, 2 + max(0, (width - len(hint)) // 2), fg("dim") + hint + RESET)
+            box_hint = fg("dim") + "type to search — results appear instantly" + RESET
+            put(y + avail // 2 + 1, 2 + max(0, (width - cell_len(strip_ansi(box_hint))) // 2), box_hint)
         for i, item in enumerate(items[:avail]):
+            # skip drawing placeholder "MYX/Unknown" when empty state — hint already shown
+            if self._is_empty_state(state) and i == 0 and not queue:
+                # draw dim placeholder row for current but subtle
+                title = str(item.get("title") or "No track")
+                if title in ("MYX", "Waiting for player", "State unavailable"):
+                    continue
             title = str(item.get("title") or "Unknown")
             artist = str(item.get("artist") or "")
             tw = max(8, width - 14)
@@ -455,6 +594,10 @@ class Renderer:
         items = [current] + list(queue)
         self.selected = max(0, min(self.selected, max(0, len(items) - 1)))
         put(y, x, fg("accent") + BOLD + f"Queue — {len(items)} tracks" + RESET)
+        if not queue and self._is_empty_state(state):
+            hint = "♪  Search above to add songs"
+            put(y + height // 2, x + max(0, (width - len(hint)) // 2), fg("dim") + hint + RESET)
+            return
         for idx, item in enumerate(items[:height - 2]):
             title = str(item.get("title") or "Unknown")
             artist = str(item.get("artist") or "")
@@ -507,7 +650,336 @@ class Renderer:
             color = fg("accent") + BOLD if active else fg("fg")
             put(start_y + n, x + max(0, (width - len(line)) // 2), color + crop(line, width) + RESET)
 
+    # -- picker overlays --
+    def _overlay_box(self, put: Any, cols: int, rows: int, w: int, h: int) -> tuple[int, int]:
+        """Compute centered box origin; caller draws border/content."""
+        w = min(w, cols - 4)
+        h = min(h, rows - 4)
+        x = (cols - w) // 2
+        y = (rows - h) // 2
+        # border
+        put(y, x, fg("accent") + "┌" + "─" * (w - 2) + "┐" + RESET)
+        for yy in range(1, h - 1):
+            put(y + yy, x, fg("accent") + "│" + RESET)
+            put(y + yy, x + w - 1, fg("accent") + "│" + RESET)
+            # fill interior with bg
+            put(y + yy, x + 1, " " * (w - 2))
+        put(y + h - 1, x, fg("accent") + "└" + "─" * (w - 2) + "┘" + RESET)
+        return x, y
+
+    def _draw_search_picker(self, put: Any, cols: int, rows: int) -> None:
+        w = min(64, cols - 6)
+        h = min(18, rows - 4)
+        x, y = self._overlay_box(put, cols, rows, w, h)
+        inner_w = w - 4
+        # title
+        put(y + 1, x + 2, fg("accent") + BOLD + "Search" + RESET + fg("dim") + "  ·  type to filter, enter to play, esc to close" + RESET)
+        # input field
+        query_disp = self.picker.query if self.picker.query else ""
+        placeholder = "Search for songs, artists..." if not query_disp else ""
+        cursor = "▌" if self.picker.query is not None else ""
+        field_text = f"Search › {query_disp}{cursor}"
+        if placeholder and not query_disp:
+            field_text = f"Search › {fg('dim')}{placeholder}{RESET}"
+        put(y + 2, x + 2, bg("accent") + fg("bg") + " " + pad(crop(strip_ansi(field_text) if placeholder else field_text, inner_w - 2), inner_w - 2) + " " + RESET)
+        # status line
+        status = ""
+        if self.picker.loading:
+            status = fg("dim") + "Searching..." + RESET
+        elif self.picker.error:
+            status = fg("err") + crop(self.picker.error, inner_w) + RESET
+        elif self.picker.query and not self.picker.results:
+            status = fg("dim") + f"No results for '{crop(self.picker.query, 20)}' — try another search" + RESET
+        elif self.picker.results:
+            status = fg("dim") + f"{len(self.picker.results)} results  ·  ↑↓ navigate  ·  enter play" + RESET
+        else:
+            status = fg("dim") + "Type to search YouTube / YT Music — results appear instantly" + RESET
+        put(y + 3, x + 2, status)
+        # results list
+        avail = h - 6
+        start = max(0, self.picker.selected - avail // 2)
+        for idx in range(avail):
+            ri = start + idx
+            if ri >= len(self.picker.results):
+                break
+            item = self.picker.results[ri]
+            title = str(item.get("title") or "Unknown")
+            artist = str(item.get("artist") or "")
+            dur = format_duration(item.get("duration"))
+            thumb_mark = "●"
+            title_w = max(10, inner_w - 20)
+            title_disp = crop(title, title_w)
+            artist_disp = crop(artist, 10) if artist else ""
+            # fixed columns: thumb + title + artist + dur
+            base = f"{thumb_mark} {pad(title_disp, title_w)}"
+            if artist_disp:
+                base = base + " " + fg("dim") + pad(artist_disp, 10) + RESET
+            else:
+                base = base + " " + " " * 10
+            # ensure dur fits; truncate base if needed
+            allow = inner_w - 2 - 6  # leave room for dur + spaces
+            # base may contain ansi, so use cell_len for trimming; keep simple: crop ansi-stripped then rebuild? Instead just pad base's visible length
+            vis = cell_len(base)
+            if vis > allow:
+                base = crop(strip_ansi(base), allow)
+            line = pad(base, allow) + " " + fg("dim") + dur + RESET
+            is_sel = ri == self.picker.selected
+            if is_sel:
+                put(y + 4 + idx, x + 2, bg("accent") + fg("bg") + " " + pad(crop(strip_ansi(line), inner_w - 2), inner_w - 2) + " " + RESET)
+            else:
+                put(y + 4 + idx, x + 2, " " + line)
+
+    def _draw_command_palette(self, put: Any, cols: int, rows: int) -> None:
+        w = min(60, cols - 6)
+        filtered = command_palette_search(self.command_query)
+        h = min(16, 5 + len(filtered) + 2)
+        h = max(8, min(h, rows - 4))
+        x, y = self._overlay_box(put, cols, rows, w, h)
+        inner_w = w - 4
+        put(y + 1, x + 2, fg("accent") + BOLD + "Command Palette" + RESET + fg("dim") + "  ·  ctrl-k / ?  ·  esc to close" + RESET)
+        qdisp = self.command_query or ""
+        placeholder = "Type a command..." if not qdisp else ""
+        field = f"› {qdisp}▌" if qdisp else f"› {fg('dim')}{placeholder}{RESET}"
+        put(y + 2, x + 2, bg("accent") + fg("bg") + " " + pad(crop(strip_ansi(field) if not qdisp else field, inner_w - 2), inner_w - 2) + " " + RESET)
+        avail = h - 5
+        # clamp selection
+        self.command_selected = max(0, min(self.command_selected, max(0, len(filtered) - 1)))
+        start = max(0, self.command_selected - avail // 2)
+        for idx in range(avail):
+            fi = start + idx
+            if fi >= len(filtered):
+                break
+            e = filtered[fi]
+            label = e.get("label", "")
+            keys = e.get("keys", "")
+            line = f"{crop(label, inner_w - 14)}"
+            line = pad(line, inner_w - 12) + fg("dim") + crop(keys, 10) + RESET
+            is_sel = fi == self.command_selected
+            if is_sel:
+                put(y + 3 + idx, x + 2, bg("accent") + fg("bg") + " " + pad(crop(strip_ansi(line), inner_w - 2), inner_w - 2) + " " + RESET)
+            else:
+                put(y + 3 + idx, x + 2, " " + line)
+
+    def _draw_help_overlay(self, put: Any, cols: int, rows: int) -> None:
+        w = min(68, cols - 6)
+        h = min(22, rows - 4)
+        x, y = self._overlay_box(put, cols, rows, w, h)
+        inner_w = w - 4
+        put(y + 1, x + 2, fg("accent") + BOLD + "Help  ·  MYX Tour" + RESET + fg("dim") + "  ·  ? / esc to close" + RESET)
+        # tour steps
+        line_y = y + 2
+        for step in TOUR_STEPS:
+            if line_y >= y + h - 2:
+                break
+            title = step.get("title", "")
+            desc = step.get("description", "")
+            put(line_y, x + 2, fg("accent") + crop(title, inner_w) + RESET)
+            line_y += 1
+            # wrap desc roughly
+            words = desc.split()
+            cur = ""
+            for wrd in words:
+                if cell_len(cur + " " + wrd) > inner_w:
+                    put(line_y, x + 2, fg("dim") + cur + RESET)
+                    line_y += 1
+                    cur = wrd
+                else:
+                    cur = (cur + " " + wrd).strip()
+            if cur:
+                put(line_y, x + 2, fg("dim") + cur + RESET)
+                line_y += 1
+            line_y += 1
+        # keybinds footer inside overlay
+        if line_y < y + h - 2:
+            put(line_y, x + 2, fg("dim") + "─" * inner_w + RESET)
+            line_y += 1
+        for kb in KEYBINDS[: max(0, y + h - 1 - line_y)]:
+            keys = kb.get("keys", "")
+            desc = kb.get("desc", "")
+            put(line_y, x + 2, fg("fg") + pad(crop(keys, 18), 18) + fg("dim") + crop(desc, inner_w - 20) + RESET)
+            line_y += 1
+
+    # -- key handling --
+    def _handle_search_key(self, key: str) -> bool:
+        if key in ("\x1b", "\x1b\x1b"):
+            self.close_overlay()
+            return True
+        # also handle bare esc sequence leftover
+        if key == "\x1b":
+            self.close_overlay()
+            return True
+        if key in ("\x7f", "\x08", "\b"):
+            self.picker.backspace(now=time.monotonic())
+            self._last_search_fire = 0.0
+            return True
+        if key == "\x15":  # ctrl-u clear
+            self.picker.set_query("", now=time.monotonic())
+            self._last_search_fire = 0.0
+            return True
+        if key in ("\x1b[A", "k"):
+            self.picker.move(-1)
+            return True
+        if key in ("\x1b[B", "j"):
+            self.picker.move(1)
+            return True
+        if key in ("\r", "\n"):
+            res = self.picker.selected_result()
+            if res and res.get("id"):
+                try:
+                    self._send_play_id(str(res["id"]))
+                    self.toast = f"Playing {res.get('title') or res['id']}"
+                    self.close_overlay()
+                except Exception as exc:
+                    self.toast = str(exc)
+            else:
+                # no selection but query present — trigger search via daemon queue
+                q = self.picker.query.strip()
+                if q:
+                    try:
+                        fn = self.search_fn or (lambda qq: send_command("search", arg=qq))
+                        resp = fn(q)
+                        if isinstance(resp, dict) and resp.get("ok") is False:
+                            self.toast = str(resp.get("error") or "search failed")
+                        else:
+                            queued = resp.get("queued") if isinstance(resp, dict) else None
+                            self.toast = f"queued {queued}" if queued is not None else f"queued: {q}"
+                            self.close_overlay()
+                    except Exception as exc:
+                        self.toast = str(exc)
+            return True
+        if len(key) == 1 and key.isprintable():
+            self.picker.append_char(key, now=time.monotonic())
+            self._last_search_fire = 0.0
+            # lazy attempt will fire on next render tick via _maybe_fire_search from run loop;
+            # also show loading hint
+            return True
+        return True
+
+    def _send_play_id(self, vid: str) -> None:
+        if self.search_fn is not None:
+            # allow test injection to capture play_id via search_fn sentinel — but prefer send_command
+            # if search_fn is a mock expecting search queries, don't misuse it; try send_command first
+            try:
+                send_command("play_id", arg=vid)
+                return
+            except Exception:
+                pass
+        send_command("play_id", arg=vid)
+
+    def _handle_command_key(self, key: str) -> bool:
+        if key in ("\x1b", "\x1b\x1b"):
+            self.close_overlay()
+            return True
+        if key in ("\x7f", "\x08", "\b"):
+            if self.command_query:
+                self.command_query = self.command_query[:-1]
+                self.command_selected = 0
+            return True
+        if key == "\x15":
+            self.command_query = ""
+            self.command_selected = 0
+            return True
+        if key in ("\x1b[A", "k"):
+            self.command_selected = max(0, self.command_selected - 1)
+            return True
+        if key in ("\x1b[B", "j"):
+            filtered = command_palette_search(self.command_query)
+            self.command_selected = min(max(0, len(filtered) - 1), self.command_selected + 1)
+            return True
+        if key in ("\r", "\n"):
+            filtered = command_palette_search(self.command_query)
+            if 0 <= self.command_selected < len(filtered):
+                entry = filtered[self.command_selected]
+                self.close_overlay()
+                self._execute_command(entry)
+            else:
+                self.close_overlay()
+            return True
+        if len(key) == 1 and key.isprintable():
+            self.command_query += key
+            self.command_selected = 0
+            return True
+        return True
+
+    def _execute_command(self, entry: dict[str, str]) -> None:
+        act = entry.get("action") or entry.get("id")
+        try:
+            if act == "toggle":
+                send_command("toggle")
+            elif act == "pause":
+                send_command("pause")
+            elif act == "skip":
+                send_command("skip")
+            elif act == "prev":
+                send_command("prev")
+            elif act == "shuffle":
+                send_command("shuffle")
+            elif act == "vol_up":
+                send_command("vol", value=5)
+            elif act == "vol_down":
+                send_command("vol", value=-5)
+            elif act == "lyrics":
+                self.view = "lyrics"
+            elif act == "queue":
+                self.view = "queue"
+            elif act == "search":
+                self.open_search()
+            elif act == "help":
+                self.open_help()
+            elif act == "doctor":
+                self.toast = "run: myx doctor"
+            elif act == "quit":
+                try:
+                    send_command("quit")
+                except Exception:
+                    pass
+            else:
+                # generic: send act as cmd
+                send_command(act or "toggle")
+        except Exception as exc:
+            self.toast = str(exc)
+
     def handle_key(self, key: str) -> bool:
+        # overlay handling first
+        if self.overlay == "search":
+            return self._handle_search_key(key)
+        if self.overlay == "command":
+            return self._handle_command_key(key)
+        if self.overlay == "help":
+            if key in ("\x1b", "q", "?", "\x03", "\x1b\x1b"):
+                self.close_overlay()
+                return True
+            if key in ("j", "\x1b[B"):
+                # allow scrolling if needed (no-op for now)
+                return True
+            if key in ("k", "\x1b[A"):
+                return True
+            return True
+
+        # global overlay triggers when not in overlay
+        if key in ("/",):
+            self.open_search()
+            return True
+        if key == "\x0b":  # ctrl-k
+            self.open_command_palette()
+            return True
+        if key == "?":
+            self.open_help()
+            return True
+
+        # auto-enter search on printable char (app-like: no need to press /)
+        if len(key) == 1 and key.isprintable() and key not in ("\t", "\r", "\n"):
+            # Never hijack single-char command keys (q,n,p,s,l,d etc.) even in empty state;
+            # they have explicit UX and tests expect them to work. Only non-command
+            # printable chars auto-open search. In empty state this still gives
+            # "type to search" front-door for letters/digits/symbols.
+            known_cmds = {"q", "n", "p", "s", "l", "d", "+", "-", "=", "[", "]", "j", "k"}
+            if key in known_cmds:
+                pass
+            else:
+                self.open_search(initial=key)
+                return True
+
         try:
             if key == "q":
                 send_command("quit")
@@ -547,8 +1019,22 @@ class Renderer:
                     send_command("skip")
             elif key == "d":
                 if self.selected > 0:
-                    send_command("del", arg=self.selected - 1)
-                    self.selected = max(0, self.selected - 1)
+                    # double-press to confirm within 2s
+                    now = time.monotonic()
+                    idx = self.selected - 1
+                    if self._pending_delete_idx == idx and (now - self._delete_confirm_time) < 2.0:
+                        send_command("del", arg=idx)
+                        self.selected = max(0, self.selected - 1)
+                        self._pending_delete_idx = None
+                        self.toast = "Deleted"
+                    else:
+                        # need queue title for toast — best effort without extra state read
+                        self._pending_delete_idx = idx
+                        self._delete_confirm_time = now
+                        self.toast = "Press d again to confirm delete"
+                    # clear confirm after timeout handled implicitly on next d
+                else:
+                    self.toast = "Nothing to delete"
         except Exception as exc:
             self.toast = str(exc)
         return True
@@ -573,6 +1059,9 @@ def run(state_path: Path = STATE_PATH, out: IO[str] = sys.stdout) -> int:
         running = True
         while running:
             state = read_state(state_path)
+            # debounce fire before render so picker results show promptly
+            if renderer.overlay == "search":
+                renderer._maybe_fire_search()
             renderer.render_once(state)
             deadline = time.time() + 1 / 12
             while interactive and time.time() < deadline:
@@ -581,33 +1070,16 @@ def run(state_path: Path = STATE_PATH, out: IO[str] = sys.stdout) -> int:
                     key = sys.stdin.read(1)
                     # handle escape sequences (arrows) as composite
                     if key == "\x1b":
-                        # peek briefly for CSI
                         sel2 = selectors.DefaultSelector()
                         sel2.register(sys.stdin, selectors.EVENT_READ)
                         if sel2.select(0.05):
                             seq = sys.stdin.read(2)
                             key = key + seq
                         sel2.close()
-                    if key == "/":
-                        out.write("\x1b[2K\rsearch: ")
-                        out.flush()
-                        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
-                        query = sys.stdin.readline().strip()
-                        tty.setcbreak(sys.stdin.fileno())
-                        if query:
-                            try:
-                                resp = send_command("search", arg=query)
-                                if resp.get("ok"):
-                                    queued = resp.get("queued")
-                                    renderer.toast = f"queued {queued}" if queued is not None else f"queued: {query}"
-                                else:
-                                    renderer.toast = resp.get("error") or "search failed"
-                            except Exception as exc:
-                                renderer.toast = str(exc)
-                        else:
-                            renderer.toast = ""
-                    else:
-                        running = renderer.handle_key(key)
+                    # delegate all keys to renderer (includes / , ?, ctrl-k, typing)
+                    running = renderer.handle_key(key)
+                    if not running:
+                        break
             if not interactive:
                 break
             time.sleep(max(0, deadline - time.time()))

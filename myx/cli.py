@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import datetime
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -26,6 +28,14 @@ REQUIRED_BINS = {
     "ffmpeg": "install ffmpeg (macOS: brew install ffmpeg)",
 }
 
+# ANSI helpers (avoid importing tui for doctor when not needed; keep simple)
+_GREEN = "\x1b[32m"
+_RED = "\x1b[31m"
+_YELLOW = "\x1b[33m"
+_DIM = "\x1b[2m"
+_BOLD = "\x1b[1m"
+_RESET = "\x1b[0m"
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="myx")
@@ -36,14 +46,205 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     sub = parser.add_subparsers(dest="subcommand")
     mcp_p = sub.add_parser("mcp", help="Run MYX as an MCP server over stdio (for agents)")
     mcp_p.add_argument("--stdio", action="store_true", help="Use stdio transport (default)")
+    doc_p = sub.add_parser("doctor", help="Check setup and daemon health")
+    doc_p.add_argument("--fix", action="store_true", help="Attempt to auto-fix issues (brew install/upgrade, stale lock cleanup)")
     return parser.parse_args(argv)
+
+
+def _bin_version(bin_name: str) -> str | None:
+    for flag in ("--version", "-version"):
+        try:
+            proc = subprocess.run(
+                [bin_name, flag],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            out = (proc.stdout or proc.stderr or "").strip().splitlines()
+            if out and out[0].strip():
+                return out[0].strip()[:120]
+            if proc.returncode == 0 and out:
+                return out[0].strip()[:120] or None
+        except Exception:
+            continue
+    return None
+
+
+def _yt_dlp_stale(version: str | None) -> bool:
+    if not version:
+        return False
+    m = re.search(r"(\d{4})\.(\d{2})\.(\d{2})", version)
+    if not m:
+        return False
+    try:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        vdate = datetime.date(y, mo, d)
+        today = datetime.date.today()
+        return (today - vdate).days > 30
+    except Exception:
+        return False
+
+
+def doctor_check() -> dict:
+    """Return a report dict with bin status, yt-dlp staleness, and daemon health."""
+    bins: dict[str, dict] = {}
+    for name, hint in REQUIRED_BINS.items():
+        installed = bool(shutil.which(name))
+        version = _bin_version(name) if installed else None
+        bins[name] = {"installed": installed, "version": version, "hint": hint}
+
+    # yt-dlp staleness
+    yt_version = bins.get("yt-dlp", {}).get("version")
+    yt_dlp_stale = bool(bins.get("yt-dlp", {}).get("installed") and _yt_dlp_stale(yt_version))
+
+    # daemon health
+    socket_exists = CMD_SOCK.exists()
+    lock_pid: int | None = None
+    lock_running = False
+    stale_lock = False
+    try:
+        raw = LOCK_PATH.read_text().strip()
+        if raw:
+            lock_pid = int(raw)
+            lock_running = _pid_running(lock_pid)
+            if not lock_running:
+                stale_lock = True
+    except Exception:
+        lock_pid = None
+        lock_running = False
+        stale_lock = False
+        # if lock file exists but unreadable, treat as stale?
+        if LOCK_PATH.exists():
+            stale_lock = True
+
+    daemon = {
+        "socket_exists": socket_exists,
+        "lock_pid": lock_pid,
+        "lock_running": lock_running,
+        "healthy": bool(socket_exists and lock_running),
+        "stale_lock": stale_lock,
+    }
+
+    # flat keys for backward compat + nested
+    report = {
+        "mpv": bins["mpv"],
+        "yt-dlp": bins["yt-dlp"],
+        "ffmpeg": bins["ffmpeg"],
+        # also expose yt_dlp underscore alias
+        "yt_dlp": bins["yt-dlp"],
+        "yt_dlp_stale": yt_dlp_stale,
+        "yt-dlp_stale": yt_dlp_stale,
+        "daemon": daemon,
+        "bins": bins,
+        "brew_available": bool(shutil.which("brew")),
+    }
+    return report
+
+
+def _print_doctor(report: dict, fix: bool = False) -> int:
+    missing = [name for name, info in report.get("bins", {}).items() if not info.get("installed")]
+    brew_available = report.get("brew_available", False)
+
+    print(f"{_BOLD}MYX doctor{_RESET}")
+    print("")
+    # bins
+    for name in ("mpv", "yt-dlp", "ffmpeg"):
+        info = report.get(name) or report.get("bins", {}).get(name, {})
+        installed = info.get("installed")
+        version = info.get("version")
+        hint = info.get("hint", "")
+        if installed:
+            ver_str = f" ({version})" if version else ""
+            print(f"  {name}: {_GREEN}OK{_RESET}{_DIM}{ver_str}{_RESET}")
+        else:
+            print(f"  {name}: {_RED}MISSING{_RESET} — {hint}")
+
+    # yt-dlp staleness
+    if report.get("yt_dlp_stale") or report.get("yt-dlp_stale"):
+        print(f"  yt-dlp: {_YELLOW}stale{_RESET} — yt-dlp is older than 30 days; run `brew upgrade yt-dlp` or `yt-dlp -U`" )
+    else:
+        # only warn if installed and stale check passed; otherwise silent
+        pass
+
+    # daemon
+    daemon = report.get("daemon", {})
+    if daemon.get("healthy"):
+        print(f"  daemon: {_GREEN}healthy{_RESET} (pid {daemon.get('lock_pid')})")
+    elif daemon.get("stale_lock"):
+        print(f"  daemon: {_YELLOW}stale lock{_RESET} (pid {daemon.get('lock_pid')} not running)")
+    else:
+        if daemon.get("socket_exists") or daemon.get("lock_pid") is not None:
+            print(f"  daemon: {_DIM}not running{_RESET}")
+        else:
+            print(f"  daemon: {_DIM}not running{_RESET}")
+
+    # fix suggestions / actions
+    if missing:
+        brew_cmd = f"brew install {' '.join(missing)}"
+        if fix and brew_available:
+            print(f"\n  fixing: running `{brew_cmd}` ...")
+            try:
+                subprocess.run(["brew", "install", *missing], timeout=120)
+                print(f"  {_GREEN}brew install completed{_RESET}")
+            except Exception as exc:
+                print(f"  {_RED}brew install failed: {exc}{_RESET}")
+                print(f"  try manually: `{brew_cmd}`")
+        else:
+            if brew_available:
+                print(f"\n  fix: `{brew_cmd}`" + (" (run `myx doctor --fix` to auto-install)" if not fix else ""))
+            else:
+                print(f"\n  fix: install missing bins: {', '.join(missing)}")
+                print(f"       macOS: `{brew_cmd}`")
+
+    if report.get("yt_dlp_stale") or report.get("yt-dlp_stale"):
+        if fix:
+            if brew_available:
+                print(f"  fixing yt-dlp: `brew upgrade yt-dlp` ...")
+                try:
+                    subprocess.run(["brew", "upgrade", "yt-dlp"], timeout=120)
+                except Exception as exc:
+                    print(f"  brew upgrade failed: {exc} — try `yt-dlp -U`")
+            else:
+                print(f"  fix yt-dlp: `yt-dlp -U`")
+                try:
+                    subprocess.run(["yt-dlp", "-U"], timeout=60)
+                except Exception:
+                    pass
+        else:
+            print(f"  hint: update yt-dlp via `brew upgrade yt-dlp` or `yt-dlp -U`")
+
+    if daemon.get("stale_lock"):
+        if fix:
+            try:
+                LOCK_PATH.unlink(missing_ok=True)
+                print(f"  cleaned stale lockfile at {LOCK_PATH}")
+            except Exception as exc:
+                print(f"  failed to clean lockfile: {exc}")
+        else:
+            print(f"  hint: stale lock at {LOCK_PATH} — run `myx doctor --fix` to clean up")
+
+    # overall status line
+    has_issue = bool(missing or report.get("yt_dlp_stale") or daemon.get("stale_lock"))
+    if not has_issue:
+        print(f"\n{_GREEN}All checks passed.{_RESET}")
+    else:
+        if not fix:
+            print(f"\n{_DIM}Run `myx doctor --fix` to attempt auto-fixes.{_RESET}")
+
+    return 0 if not missing else 1
+
+
+def run_doctor(fix: bool = False) -> int:
+    report = doctor_check()
+    return _print_doctor(report, fix=fix)
 
 
 def check_bins() -> None:
     missing = [name for name in REQUIRED_BINS if not shutil.which(name)]
     if missing:
         hints = "; ".join(REQUIRED_BINS[name] for name in missing)
-        raise SystemExit(f"missing required binary: {', '.join(missing)}. {hints}")
+        # Friendly error that points to doctor
+        raise SystemExit(f"missing required binary: {', '.join(missing)}. {hints} — run `myx doctor` for setup help")
 
 
 def _pid_running(pid: int) -> bool:
@@ -119,6 +320,9 @@ def main(argv: list[str] | None = None) -> int:
         except FileNotFoundError:
             print(_json.dumps({"playing": False, "paused": True, "queue": []}))
         return 0
+    if getattr(args, "subcommand", None) == "doctor":
+        fix = bool(getattr(args, "fix", False))
+        return run_doctor(fix=fix)
     check_bins()
     # if daemon already running and a seed url was given, append it instead of ignoring
     already = daemon_running()
@@ -145,6 +349,7 @@ def main(argv: list[str] | None = None) -> int:
         renderer.view = "lyrics"
         renderer.render_once()
         return 0
+    # no-args launches the TUI app shell (empty state shows Search placeholder)
     try:
         return tui.run()
     finally:
