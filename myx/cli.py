@@ -37,7 +37,48 @@ _BOLD = "\x1b[1m"
 _RESET = "\x1b[0m"
 
 
+def _looks_like_url_or_id(arg: str) -> bool:
+    """Heuristic: does this look like a YouTube URL or video ID?"""
+    if not arg or arg.startswith("-"):
+        return False
+    # Known subcommands - never treat as URL
+    if arg in ("mcp", "doctor", "play", "search", "help"):
+        return False
+    # youtube.com, youtu.be, music.youtube.com
+    if "youtube.com" in arg or "youtu.be" in arg or "music.youtube.com" in arg:
+        return True
+    # bare video ID: alphanumeric + _ -, 11 chars typical but accept 6+
+    # but exclude common words that could be subcommands
+    if re.fullmatch(r"[A-Za-z0-9_-]{6,}", arg):
+        return True
+    return False
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse args with custom logic to allow URL as first positional arg alongside subcommands."""
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv:
+        return argparse.Namespace(url=None, search=None, lyrics_only=False, state=False, no_lyrics=False, subcommand=None, stdio=False, fix=False)
+
+    # If first arg looks like a URL/ID, treat as seed url (not subcommand)
+    first = argv[0]
+    if _looks_like_url_or_id(first):
+        # Build a parser without subcommands for the URL case
+        parser = argparse.ArgumentParser(prog="myx", add_help=False)
+        parser.add_argument("url", nargs="?")
+        parser.add_argument("--search")
+        parser.add_argument("--lyrics-only", action="store_true")
+        parser.add_argument("--state", action="store_true")
+        parser.add_argument("--no-lyrics", action="store_true")
+        parser.add_argument("-h", "--help", action="help")
+        args = parser.parse_args(argv)
+        args.subcommand = None
+        args.stdio = False
+        args.fix = False
+        return args
+
+# First arg is a subcommand (mcp, doctor) or a flag
+    # Use full parser with subcommands, but make url optional and only used when there's no subcommand
     parser = argparse.ArgumentParser(prog="myx")
     parser.add_argument("url", nargs="?", help="YouTube or YT Music URL/video id seed")
     parser.add_argument("--search", help="Open search results into the queue")
@@ -273,12 +314,40 @@ def daemon_running() -> bool:
     return bool(pid and CMD_SOCK.exists())
 
 
+# How long to wait for a daemon's command socket before giving up.
+SOCK_WAIT_S = 5.0
+
+
+def _wait_for_cmd_sock(proc: subprocess.Popen[str] | None = None, timeout: float = SOCK_WAIT_S) -> bool:
+    """Poll until the daemon's command socket exists.
+
+    ``proc`` (when we spawned the daemon) lets us bail out early if it dies.
+    With no ``proc`` the daemon pre-existed; we bail if its lock pid vanishes.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if CMD_SOCK.exists():
+            return True
+        if proc is not None and proc.poll() is not None:
+            return CMD_SOCK.exists()
+        if proc is None and read_lock() is None:
+            return CMD_SOCK.exists()
+        time.sleep(0.05)
+    return CMD_SOCK.exists()
+
+
 def boot_daemon(seed: str | None = None, no_lyrics: bool = False) -> subprocess.Popen[str] | None:
-    if daemon_running():
+    if read_lock():
+        # A live daemon process exists (booting or running). Never spawn a
+        # second one — that races the singleton lock and double-plays audio.
+        # The caller waits on the socket via _wait_for_cmd_sock().
         return None
     args = [sys.executable, "-m", "myx.player"]
     if seed:
         args.append(seed)
+    else:
+        # No seed: boot idle so TUI search / MCP have a daemon to talk to.
+        args.append("--idle")
     if no_lyrics:
         args.append("--no-lyrics")
     env = {**os.environ, "MYX_NO_LYRICS": "1"} if no_lyrics else None

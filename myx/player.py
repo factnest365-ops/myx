@@ -38,7 +38,7 @@ def _url(video_id: str) -> str:
 
 
 class PlayerDaemon:
-    def __init__(self, url: str, no_lyrics: bool = False):
+    def __init__(self, url: str | None = None, no_lyrics: bool = False):
         self.url = url
         self.no_lyrics = no_lyrics or os.environ.get("MYX_NO_LYRICS") == "1"
         self.stop = threading.Event()
@@ -53,6 +53,7 @@ class PlayerDaemon:
         self._queue_meta_cache: dict[str, dict[str, Any]] = {}
         self._stream_cache: dict[str, str] = {}
         self._id_by_path: dict[str, str] = {}
+        self._current_meta: dict[str, Any] = {}
         self._idle_since: float | None = None
 
     def _candidate_cmd_socks(self) -> list[Path]:
@@ -67,7 +68,7 @@ class PlayerDaemon:
                 out.append(p)
         return out
 
-    def _acquire_singleton(self, url: str) -> bool:
+    def _acquire_singleton(self, url: str | None) -> bool:
         lock_path = TMPDIR / "myx.lock"
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -81,13 +82,16 @@ class PlayerDaemon:
         except Exception:
             return True
 
-        vid = _video_id(url) or url
+        vid = _video_id(url) if url else None
+        # With no seed there is nothing to hand off — probe liveness with a
+        # harmless unknown command instead of sending play_id(None).
+        req = {"cmd": "play_id", "arg": vid} if vid else {"cmd": "__probe__"}
         for sock_path in self._candidate_cmd_socks():
             try:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
                     s.settimeout(0.6)
                     s.connect(str(sock_path))
-                    s.sendall((json.dumps({"cmd": "play_id", "arg": vid}) + "\n").encode())
+                    s.sendall((json.dumps(req) + "\n").encode())
                     s.recv(1024)
                 print(f"delegated to existing daemon at {sock_path}", file=sys.stderr)
                 return False
@@ -119,11 +123,9 @@ class PlayerDaemon:
             pass
         self._spawn_mpv()
         self._wait_for_socket(MPV_SOCK)
-        seed_vid = _video_id(self.url)
-        if seed_vid:
-            self._play_now(seed_vid)
-        else:
-            self._mpv(["loadfile", self.url, "replace"])
+        # Service threads first: the command socket and state file must come up
+        # before seed stream resolution (network, can take seconds), otherwise
+        # the CLI/TUI/MCP cannot talk to us during the whole boot window.
         threads = [
             threading.Thread(target=self._command_server, daemon=True),
             threading.Thread(target=self._refill_loop, daemon=True),
@@ -134,6 +136,12 @@ class PlayerDaemon:
         for t in threads:
             t.start()
         try:
+            if self.url:
+                seed_vid = _video_id(self.url)
+                if seed_vid:
+                    self._play_now(seed_vid)
+                else:
+                    self._mpv(["loadfile", self.url, "replace"])
             while not self.stop.is_set():
                 if self.mpv and self.mpv.poll() is not None:
                     break
@@ -220,7 +228,15 @@ class PlayerDaemon:
 
     def _append_track(self, video_id: str, mark_seen: bool = True) -> bool:
         stream = self._stream_for(video_id)
-        self._mpv(["loadfile", stream, "append"])
+        # Cold start (idle daemon, empty playlist): plain "append" would queue
+        # the track without ever starting playback — mpv only starts on
+        # append-play when nothing is playing. While something plays this is
+        # identical to append (verified against the mpv manual).
+        try:
+            idle = not self._playlist()
+        except Exception:
+            idle = False
+        self._mpv(["loadfile", stream, "append-play" if idle else "append"])
         self._id_by_path[stream] = video_id
         if mark_seen:
             self.seen.add(video_id)
@@ -243,6 +259,11 @@ class PlayerDaemon:
         self._mpv(["loadfile", stream, "replace"])
         self._id_by_path[stream] = video_id
         self.seen.add(video_id)
+        # Resolve and cache metadata for current track so state shows correct title/artist
+        try:
+            self._current_meta = sources.meta(video_id)
+        except sources.SourcesError:
+            self._current_meta = {}
 
     def _append_related(self) -> bool:
         cur = self._current_id()
@@ -347,7 +368,8 @@ class PlayerDaemon:
             elif current_path:
                 self._mpv(["loadfile", current_path, "replace"])
         except Exception:
-            self._mpv(["loadfile", self.url, "replace"])
+            if self.url:
+                self._mpv(["loadfile", self.url, "replace"])
         self.cached_chain.clear()
         try:
             self._append_related()
@@ -461,7 +483,7 @@ class PlayerDaemon:
             item_id = self._id_by_path.get(item.get("filename") or "") or _video_id(item.get("filename"))
             item_title = item.get("title")
             item_duration = item.get("duration")
-            item_raw_thumb = item.get("thumbnail") if isinstance(item.get("thumbnail"), str) else None
+            item_raw_thumb = item.get("thumbnail") if isinstance(current.get("thumbnail"), str) else None
             cached_meta = self._queue_meta_cache.get(item_id, {}) if item_id else {}
             item_title = item_title or cached_meta.get("title")
             item_artist = item.get("uploader") if isinstance(item.get("uploader"), str) else cached_meta.get("artist")
@@ -477,8 +499,10 @@ class PlayerDaemon:
                 "duration": item_duration,
                 "thumb": item_thumb,
             })
-        title_val = self._mpv(["get_property", "media-title"]) or current.get("title")
-        artist_val = current.get("uploader") if isinstance(current.get("uploader"), str) else None
+        # Prefer cached metadata for current track (set by _play_now or queue hydration)
+        cached_current = self._current_meta if self._current_meta.get("id") == vid else self._queue_meta_cache.get(vid, {})
+        title_val = cached_current.get("title") or self._mpv(["get_property", "media-title"]) or current.get("title")
+        artist_val = cached_current.get("artist") or (current.get("uploader") if isinstance(current.get("uploader"), str) else None)
         dur_val = self._mpv(["get_property", "duration"])
         pos_val = self._mpv(["get_property", "time-pos"])
         vol_val = self._mpv(["get_property", "volume"])
@@ -678,15 +702,13 @@ class PlayerDaemon:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    if not argv:
-        print("usage: python -m myx.player <url>", file=sys.stderr)
-        return 2
     no_lyrics = "--no-lyrics" in argv
-    argv = [a for a in argv if a != "--no-lyrics"]
-    if not argv:
-        print("usage: python -m myx.player <url>", file=sys.stderr)
+    idle = "--idle" in argv
+    argv = [a for a in argv if a not in ("--no-lyrics", "--idle")]
+    if not argv and not idle:
+        print("usage: python -m myx.player <url> [--idle] [--no-lyrics]", file=sys.stderr)
         return 2
-    daemon = PlayerDaemon(argv[0], no_lyrics=no_lyrics)
+    daemon = PlayerDaemon(argv[0] if argv else None, no_lyrics=no_lyrics)
     def _term(_signum: int, _frame: Any) -> None:
         daemon.stop.set()
     signal.signal(signal.SIGTERM, _term)
