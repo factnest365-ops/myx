@@ -32,8 +32,8 @@ def _run_ytdlp(args: list[str]) -> str:
     except OSError as exc:
         raise SourcesError(f"could not run yt-dlp: {exc}") from exc
     if proc.returncode != 0:
-        msg = (proc.stderr or proc.stdout or "yt-dlp failed").strip().splitlines()[-1]
-        raise SourcesError(msg)
+        lines = (proc.stderr or proc.stdout or "yt-dlp failed").strip().splitlines()
+        raise SourcesError(lines[-1] if lines else "yt-dlp failed")
     return proc.stdout
 
 
