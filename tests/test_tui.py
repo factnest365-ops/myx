@@ -268,3 +268,21 @@ def test_search_note_clears_when_query_changes(monkeypatch):
     assert r._search_note
     r.handle_key("z")
     assert r._search_note == ""
+
+
+def test_header_keeps_brand_accent_and_bold():
+    """Tabs used to overwrite row 0 and strip the M Y X accent/bold."""
+    r = tui.Renderer(out=io.StringIO())
+    state = {"playing": True, "title": "Song", "queue": [{"id": "1", "title": "Song", "artist": "A", "duration": 90, "thumb": None}]}
+    line0 = r.render_once(state=state, size=(100, 32)).split("\n")[0]
+    assert "M Y X" in line0
+    assert tui.BOLD in line0, "header brand accent/bold was stripped by the tabs put"
+
+
+def test_toast_wins_over_controls_hint_row():
+    r = tui.Renderer(out=io.StringIO())
+    r.toast = "Hi there"
+    state = {"playing": True, "title": "Song", "queue": [{"id": "1", "title": "Song", "artist": "A", "duration": 90, "thumb": None}]}
+    row = r.render_once(state=state, size=(100, 32)).split("\n")[30]
+    assert "Hi there" in row
+    assert "▶ Play" not in row, "controls hint must not share the toast row"

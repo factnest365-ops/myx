@@ -626,7 +626,6 @@ class Renderer:
             post = _plain_between(raw, x + vis) if x + vis < cols else ""
             canvas[y] = bg("bg") + fg("fg") + pre + text + post + RESET
 
-        put(0, 1, fg("accent") + BOLD + "M Y X" + RESET)
         tabs = [("now", "Now Playing"), ("lyrics", "Lyrics"), ("queue", "Queue")]
         tab_parts: list[str] = []
         for idx, (key, label) in enumerate(tabs):
@@ -638,7 +637,10 @@ class Renderer:
             if idx == 0 and active:
                 pass
         tabs_str = "".join(tab_parts)
-        put(0, cols - cell_len(strip_ansi(tabs_str)) - 2, tabs_str)
+        # one put for the whole header: a second put would strip the first one's styles
+        tabs_x = max(8, cols - cell_len(strip_ansi(tabs_str)) - 2)
+        gap = max(1, tabs_x - 6)
+        put(0, 0, " " + fg("accent") + BOLD + "M Y X" + RESET + " " * gap + tabs_str)
         # vertical divider
         for yy in range(1, rows - 1):
             put(yy, left_w, fg("dim") + "│" + RESET)
@@ -656,15 +658,16 @@ class Renderer:
         if not self.toast and self._is_empty_state(state) and self.overlay != "search":
             self.toast = AUTO_HINT
 
-        # bottom controls hint row (above footer) — accent buttons
-        controls = fg("dim") + CONTROLS_HINT + RESET
-        put(rows - 2, max(0, cols - cell_len(strip_ansi(controls)) - 2), controls)
+        if self.toast:
+            # toast wins row rows-2: controls hint would collide on narrow terminals
+            put(rows - 2, 2, fg("accent") + crop(self.toast, max(0, cols - 4)) + RESET)
+        else:
+            controls = fg("dim") + CONTROLS_HINT + RESET
+            put(rows - 2, max(0, cols - cell_len(strip_ansi(controls)) - 2), controls)
 
         footer = fg("dim") + FOOTER + RESET
         # spec: always full footer visible — write at 0, not centered-clip
         put(rows - 1, 0, footer)
-        if self.toast:
-            put(rows - 2, 2, fg("accent") + self.toast + RESET)
 
         # overlays on top
         if self.overlay == "search":
