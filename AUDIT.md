@@ -19,6 +19,13 @@
 | BUG-013 | P1 | Search status says 'No results' although N tracks were queued; Enter double-queues the same query | Daemon search path (results never populated locally) | Picker `results==[]` after daemon enqueue hits the no-results branch; Enter with no selection re-fires search | `_search_note` ('queued N — added to queue') preferred in status line; cleared on query edit; Enter dismisses instead of re-firing | 3 tests: queued note, Enter guard, note clears on typing |
 | BUG-014 | P2 | Whitespace-only yt-dlp failure output crashes with IndexError instead of SourcesError | `_run_ytdlp` with stderr `' \n\t\n'` | `.strip().splitlines()[-1]` on an empty list | Guard: fall back to 'yt-dlp failed' | `test_ytdlp_whitespace_only_failure_raises_sources_error` |
 | BUG-015 | P2 | Header 'M Y X' loses accent+bold; toast and controls hint collide on rows-2 | Render any frame | Two puts on row 0 (second strips first's styles); toast and controls share rows-2 | Single-put header; toast wins rows-2, controls only when no toast | `test_header_keeps_brand_accent_and_bold`, `test_toast_wins_over_controls_hint_row` |
+| BUG-016 | P2 | Queue tracks show the current track's thumbnail or no thumbnail | Queue contains tracks with different thumbnails | `write_state()` checked `current.thumbnail` while serializing every queue item | Read each queue item's thumbnail independently | `test_queue_thumbnail_uses_each_item_thumbnail` |
+| BUG-017 | P1 | Empty JSON-RPC batches receive no response | Send `[]` to `myx mcp --stdio` | Batch loop emitted only non-empty response lists | Return `-32600 Invalid Request` for an empty batch | `test_mcp_empty_batch_is_invalid_request` |
+| BUG-018 | P1 | Malformed `tools/call` params produce the wrong failure path | Send `tools/call` with array params | Dispatcher assumed params and arguments were mappings | Validate params, tool name, and arguments before dispatch | `test_mcp_tools_call_rejects_non_object_params` |
+| BUG-019 | P0 | Live daemon appears dead during slow lyrics lookup | Block `sources.lyrics()` while polling state | Lyrics lookup ran inline in `write_state()` and readers used mtime as liveness | Fetch lyrics in a background thread; use daemon reachability only | `test_write_state_does_not_wait_for_lyrics`, `test_cli_state_keeps_old_state_for_live_daemon`, `test_mcp_state_accepts_old_state_from_live_daemon` |
+| BUG-020 | P1 | MCP emits an unsolicited initialized notification | Send an `initialize` request | Server wrote `notifications/initialized`, which is a client notification | Return only the initialize response | `test_initialize_response_precedes_no_server_notification` |
+| BUG-021 | P1 | Non-object state JSON reaches MCP tool `.get()` calls | Write a JSON list to the state file | `_read_state()` returned valid non-dict JSON directly | Return the standard empty state for non-object payloads | `test_mcp_state_rejects_non_object_json` |
+| BUG-022 | P0 | State polling reports a live daemon as dead while its command server is busy | Block command handling, then poll `--state` or MCP state | Liveness probe waited for a command reply with a short timeout | Treat successful command-socket connect as reachability; do not wait for a reply | `test_cli_liveness_does_not_wait_for_command_reply`, `test_mcp_liveness_does_not_wait_for_command_reply` |
 
 ## Usability Changes (what users will notice)
 
@@ -26,6 +33,8 @@
 - `myx --state` correctly reports `playing: false` when daemon is dead
 - Headless controls (`myx --quit`, `myx --skip`, `myx --prev`, `myx --toggle`, `myx --vol N`) work without TUI
 - `--no-lyrics` flag (from preserved patch) works for battery/memory savings
+- State polling remains truthful during slow lyrics and command handling.
+- MCP rejects malformed state payloads and malformed JSON-RPC calls with safe fallbacks/errors.
 
 ## Known Remaining Issues
 
@@ -39,4 +48,4 @@
 
 ## Audit Round 2 (2026-09-28)
 
-BUG-004..BUG-015 found and fixed with red-verified hermetic regression tests; see table. Spectrum wiring (BUG-005/006) also fixed peak-hold initialization.
+BUG-004..BUG-022 found and fixed with focused hermetic regression tests; see table. Spectrum wiring (BUG-005/006) also fixed peak-hold initialization.

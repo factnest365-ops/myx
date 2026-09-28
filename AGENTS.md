@@ -7,6 +7,13 @@ Free-stack only: Python + mpv (playback/IPC) + yt-dlp (streams, search, metadata
 - `myx --search "query"` opens search results into queue.
 - `myx mcp --stdio` runs as an MCP server over stdio (agent-native).
 - `myx --state` prints current player state as JSON and exits (agent-friendly).
+- Headless controls: `--quit`, `--skip`, `--prev`, `--toggle`, and `--vol N`; `--no-lyrics` disables lyrics lookup.
+
+## Project memory
+
+- State readers must require a live lockfile PID and a connectable command socket; state-file age is not a liveness signal.
+- Lyrics lookup runs off the state-write path so slow network calls cannot stall state updates.
+- MCP state handling falls back to the empty state for malformed JSON objects and non-object payloads; keep protocol behavior covered by `tests/test_mcp.py`.
 
 ## Architecture (4 modules, fixed contracts)
 
@@ -56,7 +63,7 @@ Free-stack only: Python + mpv (playback/IPC) + yt-dlp (streams, search, metadata
 - Theme dict: bg #0d0d0d fg #e8e3d8 accent #ff6b35 dim #7a756c err #ff4444. Optional override `~/.config/myx/config.toml`.
 
 ### myx/cli.py - entrypoint
-argparse: positional url optional, --search, --lyrics-only flag dev aid, --state for agent JSON, subcommand `mcp` for MCP server. Boots PlayerDaemon subprocess if not running (single-instance lockfile at `$TMPDIR/myx.lock`), then TUI. On quit: SIGTERM daemon, kill mpv, clean lockfile. Bin checks at boot: mpv, yt-dlp, ffmpeg — missing exits with install hint.
+argparse: positional url optional, --search, --lyrics-only flag dev aid, --no-lyrics, --state for agent JSON, headless --quit/--skip/--prev/--toggle/--vol N controls, and subcommand `mcp` for MCP server. Boots PlayerDaemon subprocess if not running (single-instance lockfile at `$TMPDIR/myx.lock`), then TUI. On quit: SIGTERM daemon, kill mpv, clean lockfile. Bin checks at boot: mpv, yt-dlp, ffmpeg — missing exits with install hint.
 
 ## Rules
 - uv project. deps: numpy>=2.0.0, pillow>=10.0.0. dev: pytest>=8.0.0. Build: hatchling. Console script: `myx` -> `myx.cli:main`.
