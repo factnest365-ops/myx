@@ -246,20 +246,44 @@ class SpectrumSource:
 @dataclass
 class CavaSource(SpectrumSource):
     proc: subprocess.Popen[bytes] | None = None
+    _buf: bytes = b""
+    _last_vals: list[float] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         if shutil.which("cava"):
             self.proc = subprocess.Popen(["cava", "-p", "/dev/stdin"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             if self.proc.stdin:
                 self.proc.stdin.write(b"[output]\nmethod = raw\nraw_target = /dev/stdout\ndata_format = ascii\nascii_max_range = 100\n")
                 self.proc.stdin.close()
+        if self.proc and self.proc.stdout:
+            try:
+                os.set_blocking(self.proc.stdout.fileno(), False)
+            except (OSError, ValueError, AttributeError):
+                pass
 
     def values(self) -> list[float]:
         if not self.proc or not self.proc.stdout:
             return super().values()
-        line = self.proc.stdout.readline().decode(errors="ignore").strip()
+        try:
+            chunk = os.read(self.proc.stdout.fileno(), 65536)
+        except BlockingIOError:
+            return list(self._last_vals) if self._last_vals else super().values()
+        except OSError:
+            return super().values()
+        if not chunk:
+            return super().values()  # EOF: cava exited
+        self._buf += chunk
+        if b"\n" not in self._buf:
+            return list(self._last_vals) if self._last_vals else super().values()
+        *lines, self._buf = self._buf.split(b"\n")
+        line = lines[-1].decode(errors="ignore")
         nums = [int(x) / 100 for x in re.findall(r"\d+", line)]
-        return (nums[: self.bars] + [0.04] * self.bars)[: self.bars]
+        if not nums:
+            return list(self._last_vals) if self._last_vals else super().values()
+        vals = (nums[: self.bars] + [0.04] * self.bars)[: self.bars]
+        self._last_vals = vals
+        return vals
 
     def close(self) -> None:
         if self.proc:
@@ -270,21 +294,44 @@ class CavaSource(SpectrumSource):
 class FfmpegTapSource(SpectrumSource):
     stream_url: str | None = None
     proc: subprocess.Popen[bytes] | None = None
+    _buf: bytes = b""
+    _last_vals: list[float] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         if self.stream_url and shutil.which("ffmpeg") and np is not None:
             self.proc = subprocess.Popen(
                 ["ffmpeg", "-loglevel", "quiet", "-re", "-i", self.stream_url, "-f", "s16le", "-ac", "1", "-ar", "8000", "-"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             )
+        if self.proc and self.proc.stdout:
+            try:
+                os.set_blocking(self.proc.stdout.fileno(), False)
+            except (OSError, ValueError, AttributeError):
+                pass
 
     def values(self) -> list[float]:
         if not self.proc or not self.proc.stdout or np is None:
             return super().values()
-        raw = self.proc.stdout.read(2048)
-        if len(raw) < 512:
+        try:
+            chunk = os.read(self.proc.stdout.fileno(), 65536)
+        except BlockingIOError:
+            chunk = b""
+        except OSError:
             return super().values()
+        if chunk:
+            self._buf += chunk
+            if len(self._buf) > 32768:
+                self._buf = self._buf[-32768:]
+        if len(self._buf) < 1024:
+            return list(self._last_vals) if self._last_vals else super().values()
+        n = min(len(self._buf), 8192)
+        n -= n % 2
+        raw = self._buf[-n:]
+        self._buf = b""
+        if len(raw) < 512:
+            return list(self._last_vals) if self._last_vals else super().values()
         samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
         fft = np.abs(np.fft.rfft(samples))[:64]
         if float(fft.max(initial=0)) <= 0:
@@ -292,7 +339,9 @@ class FfmpegTapSource(SpectrumSource):
         bins = np.array_split(np.log1p(fft), self.bars)
         vals = [float(b.mean()) for b in bins]
         m = max(vals) or 1.0
-        return [min(1.0, v / m) for v in vals]
+        vals = [min(1.0, v / m) for v in vals]
+        self._last_vals = vals
+        return vals
 
     def close(self) -> None:
         if self.proc:
@@ -441,6 +490,8 @@ class Renderer:
     selected: int = 0
     toast: str = ""
     spectrum: SpectrumSource = field(default_factory=SpectrumSource)
+    spectrum_auto: bool = False
+    _spectrum_key: Any = None
     # --- app-like picker state ---
     overlay: str | None = None  # None | "search" | "command" | "help"
     picker: PickerState = field(default_factory=PickerState)
@@ -526,9 +577,29 @@ class Renderer:
         self.command_query = ""
         self.command_selected = 0
 
+    def ensure_spectrum(self, state: dict[str, Any]) -> None:
+        """Lazily bind the best available spectrum source (once per stream url)."""
+        if not self.spectrum_auto:
+            return
+        url = str(state.get("url") or "") or None
+        if isinstance(self.spectrum, CavaSource):
+            key: Any = ("cava",)
+        else:
+            key = ("tap", url)
+        if key == self._spectrum_key:
+            return
+        if self._spectrum_key is not None:
+            try:
+                self.spectrum.close()
+            except Exception:
+                pass
+        self.spectrum = make_spectrum(url)
+        self._spectrum_key = ("cava",) if isinstance(self.spectrum, CavaSource) else ("tap", url)
+
     def render_once(self, state: dict[str, Any] | None = None, size: tuple[int, int] | None = None) -> str:
         state = state or read_state(self.state_path)
         self.lyrics.load_from_state(state)
+        self.ensure_spectrum(state)
         cols, rows = size or shutil.get_terminal_size((100, 32))
         left_w = max(24, int(cols * 0.38))
         right_w = cols - left_w - 1
@@ -692,21 +763,33 @@ class Renderer:
         put(ay + art_rows + 4, x + max(0, (width - (bar_w + 10)) // 2), fg("dim") + f"{mmss(pos)} " + fg("accent") + bar + fg("dim") + f" {mmss(dur)}" + RESET)
         vals, peaks = self.spectrum.values_with_peaks()
         base = y + height - 1
-        max_h = max(3, min(8, height // 4 if height > 20 else 4))
-        # tiny terminals: skip spectrum when it would collide with title/progress
-        if base - max_h <= ay + art_rows + 4:
+        # spectrum lives strictly below the progress bar row
+        avail = base - (ay + art_rows + 4) - 1
+        if avail < 3:
             return
+        max_h = max(3, min(8, avail, height // 4 if height > 20 else 4))
         start_x = x + max(0, (width - len(vals) * 2) // 2)
-        for i, v in enumerate(vals):
-            h = max(1, int(v * max_h))
-            peak_h = max(1, int(peaks[i] * max_h)) if i < len(peaks) else h
-            for j in range(h):
-                frac = (j + 1) / max_h * 0.55 + (i / max(1, len(vals))) * 0.45
-                put(base - j, start_x + i * 2, _bar_color(frac) + "█" + RESET)
-            if peak_h > h:
-                put(base - peak_h, start_x + i * 2, fg("accent") + "·" + RESET)
-            elif peak_h == h and h < max_h:
-                put(base - peak_h, start_x + i * 2, fg("accent") + "▀" + RESET)
+        n = len(vals)
+        # one put per row: many puts on the same row would strip each other's styles
+        for row_off in range(max_h + 1):
+            r = base - row_off
+            if r < y:
+                break
+            parts: list[str] = []
+            for i in range(n):
+                h = max(1, int(vals[i] * max_h))
+                peak_h = max(1, int(peaks[i] * max_h)) if i < len(peaks) else h
+                if row_off < h:
+                    frac = (row_off + 1) / max_h * 0.55 + (i / max(1, n)) * 0.45
+                    parts.append(_bar_color(frac) + "█")
+                elif row_off == peak_h and peak_h > h:
+                    parts.append(fg("accent") + "·")
+                elif row_off == h and peak_h == h and h < max_h:
+                    parts.append(fg("accent") + "▀")
+                else:
+                    parts.append(" ")
+                parts.append(" ")
+            put(r, start_x, "".join(parts) + RESET)
 
     def _draw_lyrics(self, put: Any, state: dict[str, Any], x: int, y: int, width: int, height: int) -> None:
         lines = self.lyrics.visible(float(state.get("position") or 0), height)
@@ -1111,6 +1194,7 @@ class Renderer:
 def run(state_path: Path = STATE_PATH, out: IO[str] = sys.stdout) -> int:
     load_theme()
     renderer = Renderer(state_path=state_path, out=out)
+    renderer.spectrum_auto = True
     old = None
     interactive = out.isatty() and sys.stdin.isatty()
     if interactive:
