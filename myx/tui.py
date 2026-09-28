@@ -377,7 +377,7 @@ def make_spectrum(stream_url: str | None = None) -> SpectrumSource:
 
 @dataclass
 class ArtRenderer:
-    last_path: str | None = None
+    last_key: tuple[str, int, int] | None = None
     last_lines: list[str] = field(default_factory=list)
     protocol: str = "none"
 
@@ -395,7 +395,8 @@ class ArtRenderer:
     def render(self, path: str | None, cells: int, rows: int) -> list[str]:
         if not path:
             return self._placeholder(cells, min(rows, cells // 2))
-        if path == self.last_path and self.last_lines:
+        key = (path, cells, rows)
+        if key == self.last_key and self.last_lines:
             return self.last_lines
         self.protocol = self.detect_protocol()
         if self.protocol == "kitty":
@@ -404,7 +405,7 @@ class ArtRenderer:
             self.last_lines = self._iterm2(path, cells, rows)
         else:
             self.last_lines = self._half_block(path, cells, rows)
-        self.last_path = path
+        self.last_key = key
         return self.last_lines
 
     def _kitty(self, path: str, cells: int, rows: int) -> list[str]:

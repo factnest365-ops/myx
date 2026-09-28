@@ -194,3 +194,18 @@ def test_tiny_terminal_renders_at_true_size():
     for i, line in enumerate(lines):
         w = _independent_disp_width(line)
         assert w <= 40, f"line {i} is {w} cells wide (max 40): {line!r}"
+
+
+def test_art_cache_key_includes_cell_size(monkeypatch):
+    """Resizing the terminal must re-render art at the new size."""
+    monkeypatch.setattr(tui.ArtRenderer, "detect_protocol", lambda self, env=None: "half-block")
+    monkeypatch.setattr(
+        tui.ArtRenderer, "_half_block", lambda self, path, cells, rows: [f"HB-{cells}x{rows}"]
+    )
+    art = tui.ArtRenderer()
+    first = art.render("/does/not/matter.jpg", 20, 10)
+    again = art.render("/does/not/matter.jpg", 20, 10)
+    resized = art.render("/does/not/matter.jpg", 30, 15)
+    assert first == ["HB-20x10"]
+    assert again == first, "same size must hit the cache"
+    assert resized == ["HB-30x15"], "size change must re-render, not serve stale cache"
