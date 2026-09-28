@@ -325,7 +325,16 @@ def write_lock(pid: int) -> None:
 
 def daemon_running() -> bool:
     pid = read_lock()
-    return bool(pid and CMD_SOCK.exists())
+    if not pid or not CMD_SOCK.exists():
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5)
+            sock.connect(str(CMD_SOCK))
+            sock.sendall(b'{"cmd":"__probe__"}\n')
+            return bool(sock.recv(1024))
+    except OSError:
+        return False
 
 
 def _read_live_state() -> dict:
@@ -334,8 +343,6 @@ def _read_live_state() -> dict:
         return empty
     path = Path(gettempdir()) / "myx-state.json"
     try:
-        if time.time() - path.stat().st_mtime > 2.0:
-            return empty
         state = json.loads(path.read_text(encoding="utf-8"))
         return state if isinstance(state, dict) else empty
     except (OSError, ValueError, TypeError):

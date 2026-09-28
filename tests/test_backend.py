@@ -264,3 +264,49 @@ def test_cli_state_rejects_stale_state(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(cli, "gettempdir", lambda: str(tmp_path))
     assert cli.main(["--state"]) == 0
     assert json.loads(capsys.readouterr().out)["playing"] is False
+
+
+def test_cli_state_keeps_old_state_for_live_daemon(monkeypatch, tmp_path, capsys):
+    from myx import cli
+
+    state = tmp_path / "myx-state.json"
+    state.write_text('{"playing": true}')
+    os.utime(state, (0, 0))
+    monkeypatch.setattr(cli, "daemon_running", lambda: True)
+    monkeypatch.setattr(cli, "gettempdir", lambda: str(tmp_path))
+    assert cli.main(["--state"]) == 0
+    assert json.loads(capsys.readouterr().out)["playing"] is True
+
+
+def test_write_state_does_not_wait_for_lyrics(monkeypatch, tmp_path):
+    import myx.player as player_mod
+    import threading
+    import time
+
+    monkeypatch.setattr(player_mod, "STATE_PATH", tmp_path / "state.json")
+    daemon = player_mod.PlayerDaemon(None)
+    monkeypatch.setattr(daemon, "_playlist", lambda: [{"filename": "abc123"}])
+    monkeypatch.setattr(daemon, "_resolve_thumb", lambda vid, thumb: None)
+    def fake_mpv(cmd):
+        return {
+            ("get_property", "playlist-pos"): 0,
+            ("get_property", "media-title"): "Title",
+            ("get_property", "duration"): 120,
+            ("get_property", "time-pos"): 1,
+            ("get_property", "volume"): 50,
+            ("get_property", "pause"): False,
+        }.get(tuple(cmd))
+    monkeypatch.setattr(daemon, "_mpv", fake_mpv)
+    started = threading.Event()
+    release = threading.Event()
+    def blocked_lyrics(*args, **kwargs):
+        started.set()
+        release.wait(2)
+        return {"lrc": None, "plain": None}
+    monkeypatch.setattr(player_mod.sources, "lyrics", blocked_lyrics)
+    began = time.monotonic()
+    daemon.write_state()
+    elapsed = time.monotonic() - began
+    release.set()
+    assert elapsed < 0.5
+    assert started.wait(0.5)

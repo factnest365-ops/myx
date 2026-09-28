@@ -181,7 +181,7 @@ def _read_state() -> dict[str, Any]:
             cmd_sock = p.parent / "myx-cmd.sock"
             pid = int(lock.read_text(encoding="utf-8").strip())
             os.kill(pid, 0)
-            if p.exists() and cmd_sock.exists() and time.time() - p.stat().st_mtime <= 2.0:
+            if p.exists() and _daemon_reachable(cmd_sock):
                 state = json.loads(p.read_text(encoding="utf-8"))
                 if isinstance(state, dict):
                     return _hydrate_queue(state)
@@ -189,6 +189,19 @@ def _read_state() -> dict[str, Any]:
         except (OSError, ValueError, TypeError):
             continue
     return {"playing": False, "paused": True, "title": None, "artist": None, "queue": []}
+
+
+def _daemon_reachable(cmd_sock: Path) -> bool:
+    if not cmd_sock.exists():
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5)
+            sock.connect(str(cmd_sock))
+            sock.sendall(b'{"cmd":"__probe__"}\n')
+            return bool(sock.recv(1024))
+    except OSError:
+        return False
 
 
 def _spotify_search(q: str) -> list[dict[str, Any]]:
@@ -450,7 +463,6 @@ def _dispatch(msg: Any) -> dict[str, Any] | None:
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
             })
-            _write({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
             return None if notification else resp
         if method.startswith("notifications/"):
             return None

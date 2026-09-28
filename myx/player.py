@@ -48,6 +48,8 @@ class PlayerDaemon:
         self.seen: set[str] = set()
         self.cached_chain: dict[str, list[str]] = {}
         self._lyrics_cache: dict[str, dict[str, str | None]] = {}
+        self._lyrics_inflight: set[str] = set()
+        self._lyrics_lock = threading.Lock()
         self._thumb_cache: dict[str, str | None] = {}
 
         self._queue_meta_cache: dict[str, dict[str, Any]] = {}
@@ -471,6 +473,19 @@ class PlayerDaemon:
             return {"lrc": None, "plain": None}
         if vid in self._lyrics_cache:
             return self._lyrics_cache[vid]
+        with self._lyrics_lock:
+            if vid in self._lyrics_cache:
+                return self._lyrics_cache[vid]
+            if vid not in self._lyrics_inflight:
+                self._lyrics_inflight.add(vid)
+                threading.Thread(
+                    target=self._fetch_lyrics,
+                    args=(vid, title, artist, duration),
+                    daemon=True,
+                ).start()
+        return {"lrc": None, "plain": None}
+
+    def _fetch_lyrics(self, vid: str, title: Any, artist: Any, duration: Any) -> None:
         try:
             dur = None
             if duration is not None:
@@ -479,13 +494,11 @@ class PlayerDaemon:
                 except Exception:
                     dur = None
             data = sources.lyrics(str(title or ""), str(artist or ""), dur)
-            self._lyrics_cache[vid] = data
-            return data
-        except sources.SourcesError:
-            self._lyrics_cache[vid] = {"lrc": None, "plain": None}
-            return self._lyrics_cache[vid]
         except Exception:
-            return {"lrc": None, "plain": None}
+            data = {"lrc": None, "plain": None}
+        with self._lyrics_lock:
+            self._lyrics_cache[vid] = data
+            self._lyrics_inflight.discard(vid)
 
     def write_state(self) -> dict[str, Any]:
         playlist = self._playlist()
