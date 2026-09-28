@@ -115,3 +115,26 @@ def test_mcp_unknown_method_and_server_survives():
     by_id = {l.get("id"): l for l in lines}
     assert by_id[1]["error"]["code"] == -32601
     assert "result" in by_id[2], "server must keep serving after an unknown method"
+
+
+def test_mcp_empty_batch_is_invalid_request():
+    lines = _run_stdio("[]\n")
+    assert lines[0]["error"]["code"] == -32600
+
+
+def test_mcp_tools_call_rejects_non_object_params():
+    lines = _run_stdio('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":[]}\n')
+    assert lines[0]["error"]["code"] == -32602
+
+
+def test_mcp_state_rejects_dead_daemon_state(tmp_path, monkeypatch):
+    import myx.mcp as mcp
+
+    state = tmp_path / "myx-state.json"
+    state.write_text('{"playing": true}')
+    (tmp_path / "myx.lock").write_text("999999999")
+    (tmp_path / "myx-cmd.sock").touch()
+    monkeypatch.setattr(mcp, "STATE_PATH", state)
+    monkeypatch.setattr(mcp, "PLAYER_STATE_PATH", state)
+    monkeypatch.setattr(mcp, "_get_fallback_tmpdirs", lambda: [])
+    assert mcp._read_state()["playing"] is False

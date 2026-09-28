@@ -177,12 +177,16 @@ def _hydrate_queue(state: dict[str, Any]) -> dict[str, Any]:
 def _read_state() -> dict[str, Any]:
     for p in _candidate_states():
         try:
-            if p.exists():
+            lock = p.parent / "myx.lock"
+            cmd_sock = p.parent / "myx-cmd.sock"
+            pid = int(lock.read_text(encoding="utf-8").strip())
+            os.kill(pid, 0)
+            if p.exists() and cmd_sock.exists() and time.time() - p.stat().st_mtime <= 2.0:
                 state = json.loads(p.read_text(encoding="utf-8"))
                 if isinstance(state, dict):
                     return _hydrate_queue(state)
                 return state
-        except Exception:
+        except (OSError, ValueError, TypeError):
             continue
     return {"playing": False, "paused": True, "title": None, "artist": None, "queue": []}
 
@@ -454,9 +458,13 @@ def _dispatch(msg: Any) -> dict[str, Any] | None:
             resp = _rpc_reply(mid, {"tools": TOOLS})
             return None if notification else resp
         if method == "tools/call":
-            params = msg.get("params") or {}
+            params = msg.get("params")
+            if not isinstance(params, dict):
+                return None if notification else _rpc_error(mid, -32602, "Invalid params")
             name = params.get("name")
-            args = params.get("arguments") or {}
+            args = params.get("arguments", {})
+            if not isinstance(name, str) or not isinstance(args, dict):
+                return None if notification else _rpc_error(mid, -32602, "Invalid params")
             resp = _rpc_reply(mid, handle_tool(name, args))
             return None if notification else resp
         if method == "ping":
@@ -501,7 +509,9 @@ def serve_stdio() -> int:
             if isinstance(item, dict) and item.get("method") == "shutdown":
                 shutdown = True
         if isinstance(msg, list):
-            if responses:
+            if not msg:
+                _write(_rpc_error(None, -32600, "Invalid Request"))
+            elif responses:
                 _write(responses)
         elif responses:
             _write(responses[0])

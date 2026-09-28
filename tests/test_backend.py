@@ -215,3 +215,52 @@ def test_headless_flag_without_daemon_errors(monkeypatch, capsys):
     rc = cli.main(["--toggle"])
     assert rc == 1
     assert "daemon not running" in capsys.readouterr().err
+
+
+def test_no_lyrics_flag_parses_and_skips_fetch(monkeypatch):
+    from myx import cli
+    import myx.player as player_mod
+
+    assert cli.parse_args(["--no-lyrics"]).no_lyrics is True
+    monkeypatch.delenv("MYX_NO_LYRICS", raising=False)
+    daemon = player_mod.PlayerDaemon(None, no_lyrics=True)
+    monkeypatch.setattr(player_mod.sources, "lyrics", lambda *args: (_ for _ in ()).throw(AssertionError("lyrics fetched")))
+    assert daemon._resolve_lyrics("abc123", "Title", "Artist", 120) == {"lrc": None, "plain": None}
+    monkeypatch.setenv("MYX_NO_LYRICS", "1")
+    assert player_mod.PlayerDaemon(None).no_lyrics is True
+
+
+def test_queue_thumbnail_uses_each_item_thumbnail(monkeypatch, tmp_path):
+    import myx.player as player_mod
+
+    monkeypatch.setattr(player_mod, "STATE_PATH", tmp_path / "state.json")
+    daemon = player_mod.PlayerDaemon(None, no_lyrics=True)
+    playlist = [
+        {"filename": "seed", "thumbnail": "current-thumb"},
+        {"filename": "next", "thumbnail": "next-thumb"},
+    ]
+    monkeypatch.setattr(daemon, "_playlist", lambda: playlist)
+    monkeypatch.setattr(daemon, "_resolve_thumb", lambda vid, thumb: thumb)
+    def fake_mpv(cmd):
+        values = {
+            ("get_property", "playlist-pos"): 0,
+            ("get_property", "duration"): 120,
+            ("get_property", "time-pos"): 1,
+            ("get_property", "volume"): 50,
+            ("get_property", "pause"): False,
+        }
+        return values.get(tuple(cmd))
+    monkeypatch.setattr(daemon, "_mpv", fake_mpv)
+    state = daemon.write_state()
+    assert state["queue"][0]["thumb"] == "next-thumb"
+
+
+def test_cli_state_rejects_stale_state(monkeypatch, tmp_path, capsys):
+    from myx import cli
+
+    state = tmp_path / "myx-state.json"
+    state.write_text('{"playing": true}')
+    monkeypatch.setattr(cli, "daemon_running", lambda: False)
+    monkeypatch.setattr(cli, "gettempdir", lambda: str(tmp_path))
+    assert cli.main(["--state"]) == 0
+    assert json.loads(capsys.readouterr().out)["playing"] is False

@@ -328,6 +328,20 @@ def daemon_running() -> bool:
     return bool(pid and CMD_SOCK.exists())
 
 
+def _read_live_state() -> dict:
+    empty = {"playing": False, "paused": True, "queue": []}
+    if not daemon_running():
+        return empty
+    path = Path(gettempdir()) / "myx-state.json"
+    try:
+        if time.time() - path.stat().st_mtime > 2.0:
+            return empty
+        state = json.loads(path.read_text(encoding="utf-8"))
+        return state if isinstance(state, dict) else empty
+    except (OSError, ValueError, TypeError):
+        return empty
+
+
 # How long to wait for a daemon's command socket before giving up.
 SOCK_WAIT_S = 5.0
 
@@ -398,14 +412,7 @@ def main(argv: list[str] | None = None) -> int:
         from .mcp import serve_stdio
         return serve_stdio()
     if getattr(args, "state", False):
-        import json as _json
-        from pathlib import Path as _Path
-        from tempfile import gettempdir as _gettmp
-        p = _Path(gettempdir()) / "myx-state.json"
-        try:
-            print(_Path(p).read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            print(_json.dumps({"playing": False, "paused": True, "queue": []}))
+        print(json.dumps(_read_live_state()))
         return 0
     if getattr(args, "subcommand", None) == "doctor":
         fix = bool(getattr(args, "fix", False))

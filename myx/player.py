@@ -500,7 +500,7 @@ class PlayerDaemon:
             item_id = self._id_by_path.get(item.get("filename") or "") or _video_id(item.get("filename"))
             item_title = item.get("title")
             item_duration = item.get("duration")
-            item_raw_thumb = item.get("thumbnail") if isinstance(current.get("thumbnail"), str) else None
+            item_raw_thumb = item.get("thumbnail") if isinstance(item.get("thumbnail"), str) else None
             cached_meta = self._queue_meta_cache.get(item_id, {}) if item_id else {}
             item_title = item_title or cached_meta.get("title")
             item_artist = item.get("uploader") if isinstance(item.get("uploader"), str) else cached_meta.get("artist")
