@@ -158,6 +158,21 @@ def test_mcp_state_accepts_old_state_from_live_daemon(tmp_path, monkeypatch):
     assert mcp._read_state()["playing"] is True
 
 
+def test_mcp_state_rejects_non_object_json(tmp_path, monkeypatch):
+    import myx.mcp as mcp
+
+    state = tmp_path / "myx-state.json"
+    state.write_text('[{"playing": true}]')
+    (tmp_path / "myx.lock").write_text("123")
+    (tmp_path / "myx-cmd.sock").touch()
+    monkeypatch.setattr(mcp, "STATE_PATH", state)
+    monkeypatch.setattr(mcp, "PLAYER_STATE_PATH", state)
+    monkeypatch.setattr(mcp, "_get_fallback_tmpdirs", lambda: [])
+    monkeypatch.setattr(mcp.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(mcp, "_daemon_reachable", lambda path: True)
+    assert mcp._read_state() == {"playing": False, "paused": True, "title": None, "artist": None, "queue": []}
+
+
 def test_initialize_response_precedes_no_server_notification():
     lines = _run_stdio('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n')
     assert len(lines) == 1

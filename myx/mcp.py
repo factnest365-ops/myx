@@ -185,7 +185,7 @@ def _read_state() -> dict[str, Any]:
                 state = json.loads(p.read_text(encoding="utf-8"))
                 if isinstance(state, dict):
                     return _hydrate_queue(state)
-                return state
+                return {"playing": False, "paused": True, "title": None, "artist": None, "queue": []}
         except (OSError, ValueError, TypeError):
             continue
     return {"playing": False, "paused": True, "title": None, "artist": None, "queue": []}
