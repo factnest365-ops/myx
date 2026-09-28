@@ -25,7 +25,13 @@ def test_search_shapes_yt_dlp_json(monkeypatch):
     }
     monkeypatch.setattr(sources, "_run_ytdlp", lambda args: json.dumps(payload))
     assert sources.search("song") == [
-        {"id": "abc123", "title": "Song", "artist": "Artist", "duration": 180, "thumb": "big"}
+        {
+            "id": "abc123",
+            "title": "Song",
+            "artist": "Artist",
+            "duration": 180,
+            "thumb": "big",
+        }
     ]
 
 
@@ -45,7 +51,7 @@ def test_lyrics_404_returns_nones(monkeypatch):
 
 
 def test_player_command_protocol_roundtrip(monkeypatch):
-    import myx.player as player
+    from myx import player
 
     sock_dir = Path(tempfile.gettempdir()) / f"myx-test-{os.getpid()}"
     sock_dir.mkdir(exist_ok=True)
@@ -56,7 +62,6 @@ def test_player_command_protocol_roundtrip(monkeypatch):
 
     def fake_mpv(cmd):
         calls.append(cmd)
-        return None
 
     daemon._mpv = fake_mpv  # type: ignore[method-assign]
     thread = threading.Thread(target=daemon._command_server, daemon=True)
@@ -68,6 +73,7 @@ def test_player_command_protocol_roundtrip(monkeypatch):
             break
         except (FileNotFoundError, ConnectionRefusedError):
             import time
+
             time.sleep(0.01)
     else:
         raise AssertionError("command socket was not ready")
@@ -85,29 +91,57 @@ def test_refill_falls_back_to_repeats_when_seen(monkeypatch):
     monkeypatch.setattr(daemon, "_current_id", lambda: "seed")
     monkeypatch.setattr(sources, "mix_chain", lambda cur: ["a", "b"])
     appended = []
-    monkeypatch.setattr(daemon, "_append_track", lambda vid, mark_seen=True: appended.append((vid, mark_seen)) or True)
+    monkeypatch.setattr(
+        daemon,
+        "_append_track",
+        lambda vid, mark_seen=True: appended.append((vid, mark_seen)) or True,
+    )
     assert daemon._append_related() is True
     assert appended == [("a", False), ("b", False)]
 
 
 # --- BUG-001: seed by URL must resolve metadata, not show raw CDN title ---
 
+
 def test_play_now_caches_meta_for_state(monkeypatch):
     daemon = PlayerDaemon("https://www.youtube.com/watch?v=abc123xyz_-")
     meta_calls = []
-    monkeypatch.setattr(daemon, "_stream_for", lambda vid: "https://cdn.example/stream.webm?sig=deadbeef")
-    monkeypatch.setattr(sources, "meta", lambda vid: meta_calls.append(vid) or {
-        "id": vid, "title": "Real Title", "artist": "Real Artist", "duration": 180, "thumb": None,
-    })
+    monkeypatch.setattr(
+        daemon,
+        "_stream_for",
+        lambda vid: "https://cdn.example/stream.webm?sig=deadbeef",
+    )
+    monkeypatch.setattr(
+        sources,
+        "meta",
+        lambda vid: (
+            meta_calls.append(vid)
+            or {
+                "id": vid,
+                "title": "Real Title",
+                "artist": "Real Artist",
+                "duration": 180,
+                "thumb": None,
+            }
+        ),
+    )
     monkeypatch.setattr(daemon, "_mpv", lambda cmd: None)
     daemon._play_now("abc123xyz_-")
     assert meta_calls == ["abc123xyz_-"]
     assert daemon._current_meta["title"] == "Real Title"
 
     # write_state must prefer the cached metadata over mpv media-title
-    monkeypatch.setattr(daemon, "_playlist", lambda: [{
-        "filename": "https://cdn.example/stream.webm?sig=deadbeef", "title": "webm&rqh=1&gir=yes&clen=1",
-    }])
+    monkeypatch.setattr(
+        daemon,
+        "_playlist",
+        lambda: [
+            {
+                "filename": "https://cdn.example/stream.webm?sig=deadbeef",
+                "title": "webm&rqh=1&gir=yes&clen=1",
+            }
+        ],
+    )
+
     def fake_mpv(cmd):
         if cmd == ["get_property", "playlist-pos"]:
             return 0
@@ -122,6 +156,7 @@ def test_play_now_caches_meta_for_state(monkeypatch):
         if cmd == ["get_property", "pause"]:
             return False
         return None
+
     monkeypatch.setattr(daemon, "_mpv", fake_mpv)
     monkeypatch.setattr(sources, "lyrics", lambda *a, **k: {"lrc": None, "plain": None})
     monkeypatch.setattr(sources, "cache_thumb", lambda *a, **k: None)
@@ -152,18 +187,24 @@ def test_state_loop_starts_after_seed_meta(monkeypatch):
     # run() calls shutdown() in finally; neuter it
     monkeypatch.setattr(daemon, "shutdown", lambda: None)
     daemon.run()
-    assert order == ["meta", "state"], f"state loop must start after seed meta, got {order}"
+    assert order == ["meta", "state"], (
+        f"state loop must start after seed meta, got {order}"
+    )
 
 
 # --- BUG-002: dead daemon must not leave a lying state file ---
 
+
 def test_shutdown_removes_state_file(tmp_path, monkeypatch):
     import myx.player as player_mod
+
     state_path = tmp_path / "myx-state.json"
     state_path.write_text('{"playing": true, "title": "stale"}')
     monkeypatch.setattr(player_mod, "STATE_PATH", state_path)
     daemon = PlayerDaemon(None)
-    monkeypatch.setattr(daemon, "_mpv", lambda cmd: (_ for _ in ()).throw(RuntimeError("no mpv")))
+    monkeypatch.setattr(
+        daemon, "_mpv", lambda cmd: (_ for _ in ()).throw(RuntimeError("no mpv"))
+    )
     daemon.shutdown()
     assert not state_path.exists(), "shutdown must unlink the state file"
 
@@ -171,34 +212,51 @@ def test_shutdown_removes_state_file(tmp_path, monkeypatch):
 def test_state_missing_after_daemon_death(tmp_path, monkeypatch):
     """myx --state on a dead daemon must report not-playing, never stale data."""
     import myx.player as player_mod
+
     state_path = tmp_path / "myx-state.json"
     monkeypatch.setattr(player_mod, "STATE_PATH", state_path)
     daemon = PlayerDaemon(None)
-    daemon.write_state = lambda: state_path.write_text('{"playing": true}') or {"playing": True}
-    monkeypatch.setattr(daemon, "_mpv", lambda cmd: (_ for _ in ()).throw(RuntimeError("no mpv")))
+    daemon.write_state = lambda: (
+        state_path.write_text('{"playing": true}') or {"playing": True}
+    )
+    monkeypatch.setattr(
+        daemon, "_mpv", lambda cmd: (_ for _ in ()).throw(RuntimeError("no mpv"))
+    )
     daemon.shutdown()
     assert not state_path.exists()
 
 
 # --- BUG-003: headless controls must parse and route ---
 
+
 def test_headless_flags_parse():
     from myx import cli
-    for flag, attr in [("--quit", "quit"), ("--skip", "skip"), ("--prev", "prev"), ("--toggle", "toggle")]:
+
+    for flag, attr in [
+        ("--quit", "quit"),
+        ("--skip", "skip"),
+        ("--prev", "prev"),
+        ("--toggle", "toggle"),
+    ]:
         args = cli.parse_args([flag])
         assert getattr(args, attr) is True, f"{flag} should set {attr}"
     args = cli.parse_args(["--vol", "80"])
     assert args.vol == 80
     # flags coexist with a seed url
-    args = cli.parse_args(["https://www.youtube.com/watch?v=abc123xyz_-", "--vol", "30"])
+    args = cli.parse_args(
+        ["https://www.youtube.com/watch?v=abc123xyz_-", "--vol", "30"]
+    )
     assert args.url is not None and args.vol == 30
 
 
 def test_headless_flag_sends_command(monkeypatch, capsys):
     from myx import cli
+
     sent = []
     monkeypatch.setattr(cli, "daemon_running", lambda: True)
-    monkeypatch.setattr(cli.tui, "send_command", lambda cmd, arg=None: sent.append((cmd, arg)))
+    monkeypatch.setattr(
+        cli.tui, "send_command", lambda cmd, arg=None: sent.append((cmd, arg))
+    )
     rc = cli.main(["--skip"])
     assert rc == 0
     assert sent == [("skip", None)]
@@ -211,6 +269,7 @@ def test_headless_flag_sends_command(monkeypatch, capsys):
 
 def test_headless_flag_without_daemon_errors(monkeypatch, capsys):
     from myx import cli
+
     monkeypatch.setattr(cli, "daemon_running", lambda: False)
     rc = cli.main(["--toggle"])
     assert rc == 1
@@ -218,14 +277,21 @@ def test_headless_flag_without_daemon_errors(monkeypatch, capsys):
 
 
 def test_no_lyrics_flag_parses_and_skips_fetch(monkeypatch):
-    from myx import cli
     import myx.player as player_mod
+    from myx import cli
 
     assert cli.parse_args(["--no-lyrics"]).no_lyrics is True
     monkeypatch.delenv("MYX_NO_LYRICS", raising=False)
     daemon = player_mod.PlayerDaemon(None, no_lyrics=True)
-    monkeypatch.setattr(player_mod.sources, "lyrics", lambda *args: (_ for _ in ()).throw(AssertionError("lyrics fetched")))
-    assert daemon._resolve_lyrics("abc123", "Title", "Artist", 120) == {"lrc": None, "plain": None}
+    monkeypatch.setattr(
+        player_mod.sources,
+        "lyrics",
+        lambda *args: (_ for _ in ()).throw(AssertionError("lyrics fetched")),
+    )
+    assert daemon._resolve_lyrics("abc123", "Title", "Artist", 120) == {
+        "lrc": None,
+        "plain": None,
+    }
     monkeypatch.setenv("MYX_NO_LYRICS", "1")
     assert player_mod.PlayerDaemon(None).no_lyrics is True
 
@@ -241,6 +307,7 @@ def test_queue_thumbnail_uses_each_item_thumbnail(monkeypatch, tmp_path):
     ]
     monkeypatch.setattr(daemon, "_playlist", lambda: playlist)
     monkeypatch.setattr(daemon, "_resolve_thumb", lambda vid, thumb: thumb)
+
     def fake_mpv(cmd):
         values = {
             ("get_property", "playlist-pos"): 0,
@@ -250,6 +317,7 @@ def test_queue_thumbnail_uses_each_item_thumbnail(monkeypatch, tmp_path):
             ("get_property", "pause"): False,
         }
         return values.get(tuple(cmd))
+
     monkeypatch.setattr(daemon, "_mpv", fake_mpv)
     state = daemon.write_state()
     assert state["queue"][0]["thumb"] == "next-thumb"
@@ -284,12 +352,16 @@ def test_cli_liveness_does_not_wait_for_command_reply(monkeypatch, tmp_path):
     class SlowCommandSocket:
         def __enter__(self):
             return self
+
         def __exit__(self, *args):
             return None
+
         def settimeout(self, value):
             return None
+
         def connect(self, path):
             return None
+
         def recv(self, size):
             raise AssertionError("liveness must not wait for a reply")
 
@@ -302,14 +374,16 @@ def test_cli_liveness_does_not_wait_for_command_reply(monkeypatch, tmp_path):
 
 
 def test_write_state_does_not_wait_for_lyrics(monkeypatch, tmp_path):
-    import myx.player as player_mod
     import threading
     import time
+
+    import myx.player as player_mod
 
     monkeypatch.setattr(player_mod, "STATE_PATH", tmp_path / "state.json")
     daemon = player_mod.PlayerDaemon(None)
     monkeypatch.setattr(daemon, "_playlist", lambda: [{"filename": "abc123"}])
     monkeypatch.setattr(daemon, "_resolve_thumb", lambda vid, thumb: None)
+
     def fake_mpv(cmd):
         return {
             ("get_property", "playlist-pos"): 0,
@@ -319,13 +393,16 @@ def test_write_state_does_not_wait_for_lyrics(monkeypatch, tmp_path):
             ("get_property", "volume"): 50,
             ("get_property", "pause"): False,
         }.get(tuple(cmd))
+
     monkeypatch.setattr(daemon, "_mpv", fake_mpv)
     started = threading.Event()
     release = threading.Event()
+
     def blocked_lyrics(*args, **kwargs):
         started.set()
         release.wait(2)
         return {"lrc": None, "plain": None}
+
     monkeypatch.setattr(player_mod.sources, "lyrics", blocked_lyrics)
     began = time.monotonic()
     daemon.write_state()

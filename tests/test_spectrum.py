@@ -56,7 +56,9 @@ def test_ffmpeg_tap_values_do_not_block_without_data(monkeypatch):
     t = threading.Thread(target=lambda: out.append(src.values()), daemon=True)
     t.start()
     t.join(0.5)
-    assert not t.is_alive(), "FfmpegTapSource.values() blocked waiting for ffmpeg output"
+    assert not t.is_alive(), (
+        "FfmpegTapSource.values() blocked waiting for ffmpeg output"
+    )
     assert out and len(out[0]) == 24
     os.close(w_fd)
 
@@ -155,7 +157,6 @@ def test_spectrum_row_bars_keep_gradient_colors(monkeypatch):
     import re
 
     per_row = [
-        len(set(re.findall(r"\x1b\[38;2;\d+;\d+;\d+m", line)))
-        for line in bar_lines
+        len(set(re.findall(r"\x1b\[38;2;\d+;\d+;\d+m", line))) for line in bar_lines
     ]
     assert max(per_row) >= 3, f"gradient colors stripped within row, got {per_row}"

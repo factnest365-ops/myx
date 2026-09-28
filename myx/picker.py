@@ -11,10 +11,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-
 # ---------------------------------------------------------------------------
 # fuzzy helpers
 # ---------------------------------------------------------------------------
+
 
 def fuzzy_score(query: str, text: str) -> float:
     """Score how well *query* matches *text* in [0, 1].
@@ -74,7 +74,10 @@ def fuzzy_filter(
 # debounce
 # ---------------------------------------------------------------------------
 
-def should_search(last_query_time: float, current_time: float, debounce_ms: int = 250) -> bool:
+
+def should_search(
+    last_query_time: float, current_time: float, debounce_ms: int = 250
+) -> bool:
     """Return True when *debounce_ms* has elapsed since *last_query_time*."""
     return (current_time - last_query_time) * 1000 >= debounce_ms
 
@@ -106,6 +109,7 @@ class Debouncer:
 # formatting helpers
 # ---------------------------------------------------------------------------
 
+
 def format_duration(value: Any) -> str:
     try:
         s = int(float(value or 0))
@@ -132,6 +136,7 @@ def format_result_line(item: dict[str, Any], width: int = 48) -> str:
 # ---------------------------------------------------------------------------
 # PickerState
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class PickerState:
@@ -212,11 +217,26 @@ COMMAND_PALETTE: list[dict[str, str]] = [
     {"id": "shuffle", "label": "Shuffle queue", "keys": "s", "action": "shuffle"},
     {"id": "vol_up", "label": "Volume up", "keys": "+ / =", "action": "vol_up"},
     {"id": "vol_down", "label": "Volume down", "keys": "- ", "action": "vol_down"},
-    {"id": "lyrics", "label": "Toggle lyrics view", "keys": "l / tab", "action": "lyrics"},
+    {
+        "id": "lyrics",
+        "label": "Toggle lyrics view",
+        "keys": "l / tab",
+        "action": "lyrics",
+    },
     {"id": "queue", "label": "Toggle queue view", "keys": "tab", "action": "queue"},
-    {"id": "search", "label": "Search YouTube / YT Music", "keys": "/ · type to search", "action": "search"},
+    {
+        "id": "search",
+        "label": "Search YouTube / YT Music",
+        "keys": "/ · type to search",
+        "action": "search",
+    },
     {"id": "help", "label": "Show help & tour", "keys": "? ", "action": "help"},
-    {"id": "doctor", "label": "Run doctor checks", "keys": "doctor", "action": "doctor"},
+    {
+        "id": "doctor",
+        "label": "Run doctor checks",
+        "keys": "doctor",
+        "action": "doctor",
+    },
     {"id": "quit", "label": "Quit MYX", "keys": "q", "action": "quit"},
 ]
 
@@ -225,7 +245,9 @@ def command_palette_search(query: str) -> list[dict[str, str]]:
     """Fuzzy-filter COMMAND_PALETTE by label/id/keys."""
     if not query.strip():
         return list(COMMAND_PALETTE)
-    return fuzzy_filter(query, COMMAND_PALETTE, key=lambda e: f"{e['label']} {e['id']} {e['keys']}")
+    return fuzzy_filter(
+        query, COMMAND_PALETTE, key=lambda e: f"{e['label']} {e['id']} {e['keys']}"
+    )
 
 
 # ---------------------------------------------------------------------------

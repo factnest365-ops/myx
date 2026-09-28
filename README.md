@@ -127,7 +127,7 @@ err = "#ff4444"
 ## Architecture
 
 - `myx/sources.py` — pure functions over `yt-dlp` JSON + `lrclib` (`search`, `mix_chain`, `meta`, `cache_thumb`, `lyrics`; 20 s timeout; `SourcesError`).
-- `myx/player.py` — `PlayerDaemon` (`python -m myx.player <url>`): spawns `mpv --input-ipc-server=$TMPDIR/myx-mpv.sock --idle=yes --no-video --ytdl-format=bestaudio`, JSON IPC, refill loop, atomic `$TMPDIR/myx-state.json` at ≥ 4 Hz, command server on `$TMPDIR/myx-cmd.sock` (JSON per line).
+- `myx/player.py` — `PlayerDaemon` (`python -m myx.player <url>`): spawns `mpv --input-ipc-server=$TMPDIR/myx-mpv.sock --idle=yes --no-video --no-ytdl`, JSON IPC, refill loop, atomic `$TMPDIR/myx-state.json` at ≥ 4 Hz, command server on `$TMPDIR/myx-cmd.sock` (JSON per line).
 - `myx/tui.py` — alt-screen 12 fps renderer: reads state file, writes command socket, owns zero playback logic.
 - `myx/mcp.py` — stdio MCP server (JSON-RPC 2.0, no deps): exposes 14 tools over stdio by wrapping the same daemon IPC + `myx-state.json`. Agent-native, TUI-optional.
 - `myx/cli.py` — entrypoint, single-instance lockfile, bin checks, `--search` / `--lyrics-only`, headless controls (`--quit`, `--skip`, `--prev`, `--toggle`, `--vol`), `--no-lyrics`, plus agent-friendly `myx --state` and `myx mcp`.

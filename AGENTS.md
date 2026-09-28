@@ -13,7 +13,7 @@ Free-stack only: Python + mpv (playback/IPC) + yt-dlp (streams, search, metadata
 
 - State readers must require a live lockfile PID and a connectable command socket; state-file age is not a liveness signal.
 - Lyrics lookup runs off the state-write path so slow network calls cannot stall state updates.
-- MCP state handling falls back to the empty state for malformed JSON objects and non-object payloads; keep protocol behavior covered by `tests/test_mcp.py`.
+- MCP state handling falls back to the empty state for malformed JSON and non-object payloads; keep protocol behavior covered by `tests/test_mcp.py`.
 
 ## Architecture (4 modules, fixed contracts)
 

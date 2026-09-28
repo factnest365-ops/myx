@@ -3,6 +3,7 @@
 Exposes MYX player controls as MCP tools so any agent can drive music.
 Reuses the existing daemon IPC (CMD_SOCK + STATE_PATH); does not own playback.
 """
+
 from __future__ import annotations
 
 import json
@@ -20,7 +21,15 @@ from typing import Any
 from . import sources
 
 try:
-    from .player import STATE_PATH as PLAYER_STATE_PATH, CMD_SOCK as PLAYER_CMD_SOCK, MPV_SOCK as PLAYER_MPV_SOCK
+    from .player import (
+        CMD_SOCK as PLAYER_CMD_SOCK,
+    )
+    from .player import (
+        MPV_SOCK as PLAYER_MPV_SOCK,
+    )
+    from .player import (
+        STATE_PATH as PLAYER_STATE_PATH,
+    )
 except Exception:
     PLAYER_STATE_PATH = Path(gettempdir()) / "myx-state.json"
     PLAYER_CMD_SOCK = Path(gettempdir()) / "myx-cmd.sock"
@@ -43,7 +52,9 @@ def _get_fallback_tmpdirs() -> list[Path]:
 def _candidate_states() -> list[Path]:
     seen: set[Path] = set()
     out: list[Path] = []
-    for p in [STATE_PATH, PLAYER_STATE_PATH] + [d / "myx-state.json" for d in _get_fallback_tmpdirs()]:
+    for p in [STATE_PATH, PLAYER_STATE_PATH] + [
+        d / "myx-state.json" for d in _get_fallback_tmpdirs()
+    ]:
         if p not in seen:
             seen.add(p)
             out.append(p)
@@ -53,7 +64,9 @@ def _candidate_states() -> list[Path]:
 def _candidate_cmd_socks() -> list[Path]:
     seen: set[Path] = set()
     out: list[Path] = []
-    for p in [CMD_SOCK, PLAYER_CMD_SOCK] + [d / "myx-cmd.sock" for d in _get_fallback_tmpdirs()]:
+    for p in [CMD_SOCK, PLAYER_CMD_SOCK] + [
+        d / "myx-cmd.sock" for d in _get_fallback_tmpdirs()
+    ]:
         if p not in seen:
             seen.add(p)
             out.append(p)
@@ -63,7 +76,9 @@ def _candidate_cmd_socks() -> list[Path]:
 def _candidate_mpv_socks() -> list[Path]:
     seen: set[Path] = set()
     out: list[Path] = []
-    for p in [PLAYER_MPV_SOCK, CMD_SOCK, PLAYER_CMD_SOCK] + [d / "myx-mpv.sock" for d in _get_fallback_tmpdirs()]:
+    for p in [PLAYER_MPV_SOCK, CMD_SOCK, PLAYER_CMD_SOCK] + [
+        d / "myx-mpv.sock" for d in _get_fallback_tmpdirs()
+    ]:
         if p not in seen:
             seen.add(p)
             out.append(p)
@@ -92,12 +107,16 @@ def _send_cmd(cmd: str, **payload: Any) -> dict[str, Any]:
                     data += chunk
                     if b"\n" in data:
                         break
-            line = data.decode(errors="ignore").strip().splitlines()[0] if data else "{}"
+            line = (
+                data.decode(errors="ignore").strip().splitlines()[0] if data else "{}"
+            )
             return json.loads(line or "{}")
         except Exception as e:
             last_err = e
             continue
-    raise RuntimeError(f"myx daemon not reachable (tried {', '.join(str(p) for p in _candidate_cmd_socks())}): {last_err}")
+    raise RuntimeError(
+        f"myx daemon not reachable (tried {', '.join(str(p) for p in _candidate_cmd_socks())}): {last_err}"
+    )
 
 
 def _mpv_direct(command: list[Any]) -> Any:
@@ -118,7 +137,9 @@ def _mpv_direct(command: list[Any]) -> Any:
                     data += chunk
                     if b"\n" in data:
                         break
-            line = data.decode(errors="ignore").strip().splitlines()[0] if data else "{}"
+            line = (
+                data.decode(errors="ignore").strip().splitlines()[0] if data else "{}"
+            )
             resp = json.loads(line or "{}")
             err = resp.get("error")
             if err not in (None, "success"):
@@ -127,7 +148,9 @@ def _mpv_direct(command: list[Any]) -> Any:
         except Exception as e:
             last_err = e
             continue
-    raise RuntimeError(f"mpv not reachable (tried {', '.join(str(p) for p in _candidate_mpv_socks())}): {last_err}")
+    raise RuntimeError(
+        f"mpv not reachable (tried {', '.join(str(p) for p in _candidate_mpv_socks())}): {last_err}"
+    )
 
 
 def _url(video_id: str) -> str:
@@ -185,10 +208,22 @@ def _read_state() -> dict[str, Any]:
                 state = json.loads(p.read_text(encoding="utf-8"))
                 if isinstance(state, dict):
                     return _hydrate_queue(state)
-                return {"playing": False, "paused": True, "title": None, "artist": None, "queue": []}
+                return {
+                    "playing": False,
+                    "paused": True,
+                    "title": None,
+                    "artist": None,
+                    "queue": [],
+                }
         except (OSError, ValueError, TypeError):
             continue
-    return {"playing": False, "paused": True, "title": None, "artist": None, "queue": []}
+    return {
+        "playing": False,
+        "paused": True,
+        "title": None,
+        "artist": None,
+        "queue": [],
+    }
 
 
 def _daemon_reachable(cmd_sock: Path) -> bool:
@@ -214,7 +249,9 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Play a YouTube/YT Music URL or video id. Starts the radio; if daemon is running, appends and plays. Example: https://www.youtube.com/watch?v=dQw4w9WgXcQ or dQw4w9WgXcQ",
         "inputSchema": {
             "type": "object",
-            "properties": {"url": {"type": "string", "description": "YouTube URL or video id"}},
+            "properties": {
+                "url": {"type": "string", "description": "YouTube URL or video id"}
+            },
             "required": ["url"],
         },
     },
@@ -223,7 +260,12 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Search YouTube (ytsearch20) and enqueue all results into the MYX queue. Returns queued count. Agents: use this to add music without needing a URL.",
         "inputSchema": {
             "type": "object",
-            "properties": {"query": {"type": "string", "description": "Search query, e.g. 'weeknd blinding lights'"}},
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query, e.g. 'weeknd blinding lights'",
+                }
+            },
             "required": ["query"],
         },
     },
@@ -269,7 +311,10 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "volume": {"type": "integer", "description": "Absolute volume 0..100"},
-                "delta": {"type": "integer", "description": "Relative delta, e.g. 5 or -5"},
+                "delta": {
+                    "type": "integer",
+                    "description": "Relative delta, e.g. 5 or -5",
+                },
             },
         },
     },
@@ -288,7 +333,9 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Remove a track from the queue by index (0 = first after current).",
         "inputSchema": {
             "type": "object",
-            "properties": {"index": {"type": "integer", "description": "Queue index to remove"}},
+            "properties": {
+                "index": {"type": "integer", "description": "Queue index to remove"}
+            },
             "required": ["index"],
         },
     },
@@ -305,7 +352,11 @@ TOOLS: list[dict[str, Any]] = [
 
 
 def _tool_result(content: Any) -> dict[str, Any]:
-    text = json.dumps(content, indent=2, ensure_ascii=False) if not isinstance(content, str) else content
+    text = (
+        json.dumps(content, indent=2, ensure_ascii=False)
+        if not isinstance(content, str)
+        else content
+    )
     return {"content": [{"type": "text", "text": text}], "isError": False}
 
 
@@ -321,6 +372,7 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 return _tool_error("url required")
             vid = None
             import re as _re
+
             for pat in (r"[?&]v=([^&]+)", r"youtu\.be/([^?&/]+)"):
                 m = _re.search(pat, url)
                 if m:
@@ -335,14 +387,31 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                         time.sleep(0.35)
                         st = _read_state()
                         if st.get("id") == vid and st.get("title"):
-                            return _tool_result({"ok": True, "playing": st.get("title"), "id": st.get("id"), "state": st})
+                            return _tool_result(
+                                {
+                                    "ok": True,
+                                    "playing": st.get("title"),
+                                    "id": st.get("id"),
+                                    "state": st,
+                                }
+                            )
                     try:
                         _mpv_direct(["loadfile", _url(vid), "replace"])
                         time.sleep(0.35)
                         st = _read_state()
-                        return _tool_result({"ok": True, "playing": st.get("title"), "id": st.get("id"), "state": st, "fallback": "mpv direct"})
+                        return _tool_result(
+                            {
+                                "ok": True,
+                                "playing": st.get("title"),
+                                "id": st.get("id"),
+                                "state": st,
+                                "fallback": "mpv direct",
+                            }
+                        )
                     except Exception as direct_exc:
-                        raise RuntimeError(f"daemon play failed, direct mpv failed: {direct_exc}") from direct_exc
+                        raise RuntimeError(
+                            f"daemon play failed, direct mpv failed: {direct_exc}"
+                        ) from direct_exc
                 else:
                     resp = _send_cmd("load", arg=url)
                     if resp.get("ok"):
@@ -352,13 +421,26 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                             _send_cmd("play_index", arg=qlen - 1)
                         time.sleep(0.35)
                         st = _read_state()
-                        return _tool_result({"ok": True, "playing": st.get("title"), "id": st.get("id"), "state": st})
+                        return _tool_result(
+                            {
+                                "ok": True,
+                                "playing": st.get("title"),
+                                "id": st.get("id"),
+                                "state": st,
+                            }
+                        )
                     return _tool_error(resp.get("error", "load failed"))
             except Exception:
-                subprocess.Popen([sys.executable, "-m", "myx.player", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.Popen(
+                    [sys.executable, "-m", "myx.player", url],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
                 time.sleep(0.8)
                 st = _read_state()
-                return _tool_result({"ok": True, "booted": True, "url": url, "state": st})
+                return _tool_result(
+                    {"ok": True, "booted": True, "url": url, "state": st}
+                )
 
         elif name == "myx_search":
             q = str(args.get("query", "")).strip()
@@ -371,9 +453,18 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             if resp.get("ok") is False:
                 try:
                     items = _spotify_search(q)
-                    return _tool_result({"ok": True, "queued": len(items), "results": items[:5], "note": "daemon not running, results not enqueued"})
+                    return _tool_result(
+                        {
+                            "ok": True,
+                            "queued": len(items),
+                            "results": items[:5],
+                            "note": "daemon not running, results not enqueued",
+                        }
+                    )
                 except sources.SourcesError as e:
-                    return _tool_result({"ok": False, "queued": 0, "results": [], "error": str(e)})
+                    return _tool_result(
+                        {"ok": False, "queued": 0, "results": [], "error": str(e)}
+                    )
                 except Exception as e:
                     return _tool_error(str(e))
             return _tool_result(resp)
@@ -383,7 +474,16 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
         elif name == "myx_queue":
             st = _read_state()
-            return _tool_result({"queue": st.get("queue", []), "current": {"title": st.get("title"), "artist": st.get("artist"), "id": st.get("id")}})
+            return _tool_result(
+                {
+                    "queue": st.get("queue", []),
+                    "current": {
+                        "title": st.get("title"),
+                        "artist": st.get("artist"),
+                        "id": st.get("id"),
+                    },
+                }
+            )
 
         elif name == "myx_skip":
             return _tool_result(_send_cmd("skip"))
@@ -412,7 +512,14 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
         elif name == "myx_lyrics":
             st = _read_state()
-            return _tool_result({"lrc": st.get("lrc"), "plain": st.get("plain") or st.get("lyrics"), "title": st.get("title"), "artist": st.get("artist")})
+            return _tool_result(
+                {
+                    "lrc": st.get("lrc"),
+                    "plain": st.get("plain") or st.get("lyrics"),
+                    "title": st.get("title"),
+                    "artist": st.get("artist"),
+                }
+            )
 
         elif name == "myx_remove":
             idx = int(args.get("index", 0))
@@ -457,11 +564,14 @@ def _dispatch(msg: Any) -> dict[str, Any] | None:
     notification = not has_id
     try:
         if method == "initialize":
-            resp = _rpc_reply(mid, {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-            })
+            resp = _rpc_reply(
+                mid,
+                {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {"listChanged": False}},
+                    "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+                },
+            )
             return None if notification else resp
         if method.startswith("notifications/"):
             return None
@@ -471,11 +581,15 @@ def _dispatch(msg: Any) -> dict[str, Any] | None:
         if method == "tools/call":
             params = msg.get("params")
             if not isinstance(params, dict):
-                return None if notification else _rpc_error(mid, -32602, "Invalid params")
+                return (
+                    None if notification else _rpc_error(mid, -32602, "Invalid params")
+                )
             name = params.get("name")
             args = params.get("arguments", {})
             if not isinstance(name, str) or not isinstance(args, dict):
-                return None if notification else _rpc_error(mid, -32602, "Invalid params")
+                return (
+                    None if notification else _rpc_error(mid, -32602, "Invalid params")
+                )
             resp = _rpc_reply(mid, handle_tool(name, args))
             return None if notification else resp
         if method == "ping":

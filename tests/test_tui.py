@@ -25,8 +25,20 @@ def mock_state(tmp_path: Path) -> Path:
         "position": 11,
         "volume": 100,
         "queue": [
-            {"id": "2", "title": "Holiday", "artist": "Green Day", "duration": 232, "thumb": None},
-            {"id": "3", "title": "Never Fade Away", "artist": "SAMURAI", "duration": 205, "thumb": None},
+            {
+                "id": "2",
+                "title": "Holiday",
+                "artist": "Green Day",
+                "duration": 232,
+                "thumb": None,
+            },
+            {
+                "id": "3",
+                "title": "Never Fade Away",
+                "artist": "SAMURAI",
+                "duration": 205,
+                "thumb": None,
+            },
         ],
         "lrc": "[00:10.00]Call out my name\n[00:20.00]When I kiss you",
     }
@@ -150,8 +162,20 @@ def test_narrow_terminal_lines_fit_width():
         "duration": 200,
         "position": 10,
         "queue": [
-            {"id": "2", "title": "打上花火 (DAOKO × 米津玄師)", "artist": "DAOKO", "duration": 180, "thumb": None},
-            {"id": "3", "title": "Album 🔀 Unshuffle", "artist": "Artist", "duration": 90, "thumb": None},
+            {
+                "id": "2",
+                "title": "打上花火 (DAOKO × 米津玄師)",
+                "artist": "DAOKO",
+                "duration": 180,
+                "thumb": None,
+            },
+            {
+                "id": "3",
+                "title": "Album 🔀 Unshuffle",
+                "artist": "Artist",
+                "duration": 90,
+                "thumb": None,
+            },
         ],
     }
     out = io.StringIO()
@@ -185,7 +209,9 @@ def test_tiny_terminal_renders_at_true_size():
         "thumb": None,
         "duration": 100,
         "position": 5,
-        "queue": [{"id": "2", "title": "Next", "artist": "B", "duration": 90, "thumb": None}],
+        "queue": [
+            {"id": "2", "title": "Next", "artist": "B", "duration": 90, "thumb": None}
+        ],
     }
     renderer = tui.Renderer(out=io.StringIO())
     frame = renderer.render_once(state=state, size=(40, 15))
@@ -198,9 +224,13 @@ def test_tiny_terminal_renders_at_true_size():
 
 def test_art_cache_key_includes_cell_size(monkeypatch):
     """Resizing the terminal must re-render art at the new size."""
-    monkeypatch.setattr(tui.ArtRenderer, "detect_protocol", lambda self, env=None: "half-block")
     monkeypatch.setattr(
-        tui.ArtRenderer, "_half_block", lambda self, path, cells, rows: [f"HB-{cells}x{rows}"]
+        tui.ArtRenderer, "detect_protocol", lambda self, env=None: "half-block"
+    )
+    monkeypatch.setattr(
+        tui.ArtRenderer,
+        "_half_block",
+        lambda self, path, cells, rows: [f"HB-{cells}x{rows}"],
     )
     art = tui.ArtRenderer()
     first = art.render("/does/not/matter.jpg", 20, 10)
@@ -220,7 +250,9 @@ def test_auto_hint_toast_clears_after_recovery():
     playing = {
         "playing": True,
         "title": "Song",
-        "queue": [{"id": "1", "title": "Song", "artist": "A", "duration": 90, "thumb": None}],
+        "queue": [
+            {"id": "1", "title": "Song", "artist": "A", "duration": 90, "thumb": None}
+        ],
     }
     frame = r.render_once(state=playing, size=(100, 32))
     assert r.toast == "", "stale auto hint must clear on recovery"
@@ -228,14 +260,18 @@ def test_auto_hint_toast_clears_after_recovery():
 
 
 def test_daemon_search_shows_queued_note_not_no_results(monkeypatch):
-    monkeypatch.setattr(tui, "send_command", lambda cmd, **kw: {"ok": True, "queued": 3})
+    monkeypatch.setattr(
+        tui, "send_command", lambda cmd, **kw: {"ok": True, "queued": 3}
+    )
     r = tui.Renderer(out=io.StringIO())
     r.open_search()
     r.picker.set_query("hello", now=100.0)
     r._maybe_fire_search(now=101.0)
     assert r._search_note == "queued 3 — added to queue"
     assert r.picker.results == []
-    frame = r.render_once(state={"playing": False, "title": "MYX", "queue": []}, size=(100, 32))
+    frame = r.render_once(
+        state={"playing": False, "title": "MYX", "queue": []}, size=(100, 32)
+    )
     assert "added to queue" in frame
     assert "No results" not in frame
 
@@ -260,7 +296,9 @@ def test_enter_does_not_double_queue_after_daemon_search(monkeypatch):
 
 
 def test_search_note_clears_when_query_changes(monkeypatch):
-    monkeypatch.setattr(tui, "send_command", lambda cmd, **kw: {"ok": True, "queued": 3})
+    monkeypatch.setattr(
+        tui, "send_command", lambda cmd, **kw: {"ok": True, "queued": 3}
+    )
     r = tui.Renderer(out=io.StringIO())
     r.open_search()
     r.picker.set_query("hello", now=100.0)
@@ -273,7 +311,13 @@ def test_search_note_clears_when_query_changes(monkeypatch):
 def test_header_keeps_brand_accent_and_bold():
     """Tabs used to overwrite row 0 and strip the M Y X accent/bold."""
     r = tui.Renderer(out=io.StringIO())
-    state = {"playing": True, "title": "Song", "queue": [{"id": "1", "title": "Song", "artist": "A", "duration": 90, "thumb": None}]}
+    state = {
+        "playing": True,
+        "title": "Song",
+        "queue": [
+            {"id": "1", "title": "Song", "artist": "A", "duration": 90, "thumb": None}
+        ],
+    }
     line0 = r.render_once(state=state, size=(100, 32)).split("\n")[0]
     assert "M Y X" in line0
     assert tui.BOLD in line0, "header brand accent/bold was stripped by the tabs put"
@@ -282,7 +326,13 @@ def test_header_keeps_brand_accent_and_bold():
 def test_toast_wins_over_controls_hint_row():
     r = tui.Renderer(out=io.StringIO())
     r.toast = "Hi there"
-    state = {"playing": True, "title": "Song", "queue": [{"id": "1", "title": "Song", "artist": "A", "duration": 90, "thumb": None}]}
+    state = {
+        "playing": True,
+        "title": "Song",
+        "queue": [
+            {"id": "1", "title": "Song", "artist": "A", "duration": 90, "thumb": None}
+        ],
+    }
     row = r.render_once(state=state, size=(100, 32)).split("\n")[30]
     assert "Hi there" in row
     assert "▶ Play" not in row, "controls hint must not share the toast row"

@@ -21,7 +21,7 @@ def test_mcp_tools_list_shape():
 
 
 def test_mcp_state_via_handle(tmp_path, monkeypatch):
-    import myx.mcp as mcp
+    from myx import mcp
 
     fake_state = {"playing": True, "title": "Hello", "queue": []}
     monkeypatch.setattr(mcp, "_read_state", lambda: fake_state)
@@ -43,7 +43,9 @@ def test_mcp_stdio_roundtrip():
         timeout=5,
     )
     assert proc.returncode == 0
-    lines = [json.loads(l) for l in proc.stdout.splitlines() if l.strip().startswith("{")]
+    lines = [
+        json.loads(l) for l in proc.stdout.splitlines() if l.strip().startswith("{")
+    ]
     by_id = {l.get("id"): l for l in lines if "id" in l}
     assert "result" in by_id[1]
     assert "tools" in by_id[2]["result"]
@@ -51,7 +53,7 @@ def test_mcp_stdio_roundtrip():
 
 
 def test_cli_state_outputs_json(tmp_path):
-    import myx.cli as cli
+    from myx import cli
 
     # --state should not require mpv, just cat state file
     assert cli.parse_args(["--state"]).state is True
@@ -129,7 +131,7 @@ def test_mcp_tools_call_rejects_non_object_params():
 
 
 def test_mcp_state_rejects_dead_daemon_state(tmp_path, monkeypatch):
-    import myx.mcp as mcp
+    from myx import mcp
 
     state = tmp_path / "myx-state.json"
     state.write_text('{"playing": true}')
@@ -137,13 +139,13 @@ def test_mcp_state_rejects_dead_daemon_state(tmp_path, monkeypatch):
     (tmp_path / "myx-cmd.sock").touch()
     monkeypatch.setattr(mcp, "STATE_PATH", state)
     monkeypatch.setattr(mcp, "PLAYER_STATE_PATH", state)
-    monkeypatch.setattr(mcp, "_get_fallback_tmpdirs", lambda: [])
+    monkeypatch.setattr(mcp, "_get_fallback_tmpdirs", list)
     monkeypatch.setattr(mcp, "_daemon_reachable", lambda path: False)
     assert mcp._read_state()["playing"] is False
 
 
 def test_mcp_state_accepts_old_state_from_live_daemon(tmp_path, monkeypatch):
-    import myx.mcp as mcp
+    from myx import mcp
 
     state = tmp_path / "myx-state.json"
     state.write_text('{"playing": true}')
@@ -152,14 +154,14 @@ def test_mcp_state_accepts_old_state_from_live_daemon(tmp_path, monkeypatch):
     (tmp_path / "myx-cmd.sock").touch()
     monkeypatch.setattr(mcp, "STATE_PATH", state)
     monkeypatch.setattr(mcp, "PLAYER_STATE_PATH", state)
-    monkeypatch.setattr(mcp, "_get_fallback_tmpdirs", lambda: [])
+    monkeypatch.setattr(mcp, "_get_fallback_tmpdirs", list)
     monkeypatch.setattr(mcp.os, "kill", lambda pid, sig: None)
     monkeypatch.setattr(mcp, "_daemon_reachable", lambda path: True)
     assert mcp._read_state()["playing"] is True
 
 
 def test_mcp_state_rejects_non_object_json(tmp_path, monkeypatch):
-    import myx.mcp as mcp
+    from myx import mcp
 
     state = tmp_path / "myx-state.json"
     state.write_text('[{"playing": true}]')
@@ -167,24 +169,34 @@ def test_mcp_state_rejects_non_object_json(tmp_path, monkeypatch):
     (tmp_path / "myx-cmd.sock").touch()
     monkeypatch.setattr(mcp, "STATE_PATH", state)
     monkeypatch.setattr(mcp, "PLAYER_STATE_PATH", state)
-    monkeypatch.setattr(mcp, "_get_fallback_tmpdirs", lambda: [])
+    monkeypatch.setattr(mcp, "_get_fallback_tmpdirs", list)
     monkeypatch.setattr(mcp.os, "kill", lambda pid, sig: None)
     monkeypatch.setattr(mcp, "_daemon_reachable", lambda path: True)
-    assert mcp._read_state() == {"playing": False, "paused": True, "title": None, "artist": None, "queue": []}
+    assert mcp._read_state() == {
+        "playing": False,
+        "paused": True,
+        "title": None,
+        "artist": None,
+        "queue": [],
+    }
 
 
 def test_mcp_liveness_does_not_wait_for_command_reply(tmp_path, monkeypatch):
-    import myx.mcp as mcp
+    from myx import mcp
 
     class SlowCommandSocket:
         def __enter__(self):
             return self
+
         def __exit__(self, *args):
             return None
+
         def settimeout(self, value):
             return None
+
         def connect(self, path):
             return None
+
         def recv(self, size):
             raise AssertionError("liveness must not wait for a reply")
 

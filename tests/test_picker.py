@@ -1,6 +1,3 @@
-import time
-
-import myx.picker as picker
 from myx.picker import (
     COMMAND_PALETTE,
     KEYBINDS,
@@ -30,7 +27,11 @@ def test_fuzzy_filter_scoring():
     assert fuzzy_filter("", items) == items
     assert fuzzy_filter("   ", items) == items
     # with key function
-    dicts = [{"title": "Bohemian Rhapsody"}, {"title": "Bohemian"}, {"title": "Rap God"}]
+    dicts = [
+        {"title": "Bohemian Rhapsody"},
+        {"title": "Bohemian"},
+        {"title": "Rap God"},
+    ]
     res = fuzzy_filter("bohemian", dicts, key=lambda d: d["title"])
     assert res[0]["title"] in ("Bohemian Rhapsody", "Bohemian")
     assert len(res) == 2
@@ -139,12 +140,16 @@ def test_help_and_tour_content():
 
 # --- TUI picker overlay hermetic tests (no mpv/network) ---
 
+
 def test_tui_search_picker_overlay_and_typing(monkeypatch):
-    from myx import tui
     import io
 
+    from myx import tui
+
     # mock send_command to avoid socket
-    monkeypatch.setattr(tui, "send_command", lambda cmd, **kw: {"ok": True, "queued": 1})
+    monkeypatch.setattr(
+        tui, "send_command", lambda cmd, **kw: {"ok": True, "queued": 1}
+    )
 
     r = tui.Renderer(out=io.StringIO())
     # empty state check: should be considered empty
@@ -190,8 +195,9 @@ def test_tui_search_picker_overlay_and_typing(monkeypatch):
 
 
 def test_tui_command_palette_and_help_toggle(monkeypatch):
-    from myx import tui
     import io
+
+    from myx import tui
 
     monkeypatch.setattr(tui, "send_command", lambda cmd, **kw: {"ok": True})
 
@@ -219,13 +225,26 @@ def test_tui_command_palette_and_help_toggle(monkeypatch):
 
 
 def test_tui_queue_delete_confirm(monkeypatch):
-    from myx import tui
     import io
 
+    from myx import tui
+
     calls = []
-    monkeypatch.setattr(tui, "send_command", lambda cmd, **kw: (calls.append((cmd, kw)), {"ok": True})[1])
+    monkeypatch.setattr(
+        tui,
+        "send_command",
+        lambda cmd, **kw: (calls.append((cmd, kw)), {"ok": True})[1],
+    )
     # ensure non-empty state so 'd' is not hijacked as search
-    monkeypatch.setattr(tui, "read_state", lambda p=None: {"playing": True, "title": "Song", "queue": [{"id": "1", "title": "A"}, {"id": "2", "title": "B"}]})
+    monkeypatch.setattr(
+        tui,
+        "read_state",
+        lambda p=None: {
+            "playing": True,
+            "title": "Song",
+            "queue": [{"id": "1", "title": "A"}, {"id": "2", "title": "B"}],
+        },
+    )
 
     r = tui.Renderer(out=io.StringIO())
     r.selected = 1
@@ -239,8 +258,9 @@ def test_tui_queue_delete_confirm(monkeypatch):
 
 
 def test_tui_footer_and_controls_visible(monkeypatch):
-    from myx import tui
     import io
+
+    from myx import tui
 
     r = tui.Renderer(out=io.StringIO())
     state = {
@@ -254,7 +274,15 @@ def test_tui_footer_and_controls_visible(monkeypatch):
         "duration": 200,
         "position": 10,
         "volume": 80,
-        "queue": [{"id": "2", "title": "Next", "artist": "Other", "duration": 180, "thumb": None}],
+        "queue": [
+            {
+                "id": "2",
+                "title": "Next",
+                "artist": "Other",
+                "duration": 180,
+                "thumb": None,
+            }
+        ],
     }
     frame = r.render_once(state=state, size=(120, 32))
     assert tui.FOOTER in frame
@@ -263,33 +291,55 @@ def test_tui_footer_and_controls_visible(monkeypatch):
 
 
 def test_tui_search_picker_render_contains_placeholder(monkeypatch):
-    from myx import tui
     import io
+
+    from myx import tui
 
     monkeypatch.setattr(tui, "send_command", lambda cmd, **kw: {"ok": True})
     r = tui.Renderer(out=io.StringIO())
     r.open_search()
-    frame = r.render_once(state={"playing": False, "title": "MYX", "queue": []}, size=(100, 32))
+    frame = r.render_once(
+        state={"playing": False, "title": "MYX", "queue": []}, size=(100, 32)
+    )
     assert "Search" in frame
     assert "Search for songs" in frame or "Search \u203a" in frame
 
     # with results, titles appear
-    r.picker.set_results([
-        {"id": "1", "title": "Bohemian Rhapsody", "artist": "Queen", "duration": 355, "thumb": None},
-        {"id": "2", "title": "Stairway to Heaven", "artist": "Led Zeppelin", "duration": 482, "thumb": None},
-    ])
-    frame2 = r.render_once(state={"playing": False, "title": "MYX", "queue": []}, size=(100, 32))
+    r.picker.set_results(
+        [
+            {
+                "id": "1",
+                "title": "Bohemian Rhapsody",
+                "artist": "Queen",
+                "duration": 355,
+                "thumb": None,
+            },
+            {
+                "id": "2",
+                "title": "Stairway to Heaven",
+                "artist": "Led Zeppelin",
+                "duration": 482,
+                "thumb": None,
+            },
+        ]
+    )
+    frame2 = r.render_once(
+        state={"playing": False, "title": "MYX", "queue": []}, size=(100, 32)
+    )
     assert "Bohemian Rhapsody" in frame2
     assert "Queen" in frame2
 
 
 def test_tui_help_overlay_renders_tour(monkeypatch):
-    from myx import tui
     import io
+
+    from myx import tui
 
     r = tui.Renderer(out=io.StringIO())
     r.open_help()
-    frame = r.render_once(state={"playing": True, "title": "Song", "queue": []}, size=(100, 32))
+    frame = r.render_once(
+        state={"playing": True, "title": "Song", "queue": []}, size=(100, 32)
+    )
     assert "Help" in frame
     assert "Step 1" in frame
     assert "Step 2" in frame
@@ -297,22 +347,28 @@ def test_tui_help_overlay_renders_tour(monkeypatch):
 
 
 def test_tui_command_palette_render_filters(monkeypatch):
-    from myx import tui
     import io
+
+    from myx import tui
 
     monkeypatch.setattr(tui, "send_command", lambda cmd, **kw: {"ok": True})
     r = tui.Renderer(out=io.StringIO())
     r.open_command_palette()
     r.command_query = "shuf"
-    frame = r.render_once(state={"playing": True, "title": "Song", "queue": []}, size=(100, 32))
+    frame = r.render_once(
+        state={"playing": True, "title": "Song", "queue": []}, size=(100, 32)
+    )
     assert "Shuffle" in frame
 
 
 def test_is_empty_shows_hint(monkeypatch):
-    from myx import tui
     import io
+
+    from myx import tui
 
     r = tui.Renderer(out=io.StringIO())
     # empty state should produce updating hint in frame (as toast)
-    frame = r.render_once(state={"playing": False, "title": "MYX", "queue": []}, size=(100, 32))
+    frame = r.render_once(
+        state={"playing": False, "title": "MYX", "queue": []}, size=(100, 32)
+    )
     assert "Search above to add songs" in frame or "Search to add songs" in frame

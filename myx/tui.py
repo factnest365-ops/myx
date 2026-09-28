@@ -19,10 +19,11 @@ import termios
 import time
 import tty
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import gettempdir
-from typing import IO, Any, Callable
+from typing import IO, Any
 
 try:  # numpy is allowed for the spectrum tap.
     import numpy as np
@@ -31,30 +32,28 @@ except Exception:  # pragma: no cover - exercised only without project deps
 
 try:
     from .picker import (  # type: ignore
-        COMMAND_PALETTE,
         KEYBINDS,
         TOUR_STEPS,
         PickerState,
         command_palette_search,
         format_duration,
-        fuzzy_filter,
     )
 except Exception:  # fallback for hermetic env without package install
     from myx.picker import (  # type: ignore
-        COMMAND_PALETTE,
         KEYBINDS,
         TOUR_STEPS,
         PickerState,
         command_palette_search,
         format_duration,
-        fuzzy_filter,
     )
 
 STATE_PATH = Path(os.environ.get("MYX_STATE", Path(gettempdir()) / "myx-state.json"))
 CMD_SOCK = Path(os.environ.get("MYX_CMD_SOCK", Path(gettempdir()) / "myx-cmd.sock"))
 FOOTER = "type to search · ? help · q quit · space pause · n next · p prev · s shuffle · +,- vol · l lyrics · enter play"
 CONTROLS_HINT = "[ ▶ Play ] [ ⏸ Pause ] [ ⏭ Next ] [ 🔀 Shuffle ]"
-AUTO_HINT = "♪  Search to add songs  ·  Updating player... run myx doctor if this persists"
+AUTO_HINT = (
+    "♪  Search to add songs  ·  Updating player... run myx doctor if this persists"
+)
 
 THEME = {
     "bg": "#0d0d0d",
@@ -192,7 +191,7 @@ def load_theme() -> None:
         if "=" not in line:
             continue
         key, value = [p.strip() for p in line.split("=", 1)]
-        value = value.strip('"\'')
+        value = value.strip("\"'")
         if key in THEME and re.fullmatch(r"#[0-9a-fA-F]{6}", value):
             THEME[key] = value
 
@@ -201,9 +200,23 @@ def read_state(path: Path = STATE_PATH) -> dict[str, Any]:
     try:
         return json.loads(path.read_text())
     except FileNotFoundError:
-        return {"version": 1, "playing": False, "paused": True, "title": "MYX", "artist": "Waiting for player", "queue": []}
+        return {
+            "version": 1,
+            "playing": False,
+            "paused": True,
+            "title": "MYX",
+            "artist": "Waiting for player",
+            "queue": [],
+        }
     except Exception:
-        return {"version": 1, "playing": False, "paused": True, "title": "State unavailable", "artist": "", "queue": []}
+        return {
+            "version": 1,
+            "playing": False,
+            "paused": True,
+            "title": "State unavailable",
+            "artist": "",
+            "queue": [],
+        }
 
 
 def send_command(cmd: str, **payload: Any) -> dict[str, Any]:
@@ -253,9 +266,16 @@ class CavaSource(SpectrumSource):
     def __post_init__(self) -> None:
         super().__post_init__()
         if shutil.which("cava"):
-            self.proc = subprocess.Popen(["cava", "-p", "/dev/stdin"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            self.proc = subprocess.Popen(
+                ["cava", "-p", "/dev/stdin"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
             if self.proc.stdin:
-                self.proc.stdin.write(b"[output]\nmethod = raw\nraw_target = /dev/stdout\ndata_format = ascii\nascii_max_range = 100\n")
+                self.proc.stdin.write(
+                    b"[output]\nmethod = raw\nraw_target = /dev/stdout\ndata_format = ascii\nascii_max_range = 100\n"
+                )
                 self.proc.stdin.close()
         if self.proc and self.proc.stdout:
             try:
@@ -302,7 +322,21 @@ class FfmpegTapSource(SpectrumSource):
         super().__post_init__()
         if self.stream_url and shutil.which("ffmpeg") and np is not None:
             self.proc = subprocess.Popen(
-                ["ffmpeg", "-loglevel", "quiet", "-re", "-i", self.stream_url, "-f", "s16le", "-ac", "1", "-ar", "8000", "-"],
+                [
+                    "ffmpeg",
+                    "-loglevel",
+                    "quiet",
+                    "-re",
+                    "-i",
+                    self.stream_url,
+                    "-f",
+                    "s16le",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "8000",
+                    "-",
+                ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             )
@@ -411,18 +445,35 @@ class ArtRenderer:
 
     def _kitty(self, path: str, cells: int, rows: int) -> list[str]:
         data = base64.b64encode(Path(path).read_bytes()).decode()
-        return [f"\x1b_Gf=100,a=T,s={cells},v={rows};{data}\x1b\\"] + [""] * max(0, rows - 1)
+        return [f"\x1b_Gf=100,a=T,s={cells},v={rows};{data}\x1b\\"] + [""] * max(
+            0, rows - 1
+        )
 
     def _iterm2(self, path: str, cells: int, rows: int) -> list[str]:
         data = base64.b64encode(Path(path).read_bytes()).decode()
-        return [f"\x1b]1337;File=inline=1;width={cells};height={rows};preserveAspectRatio=1:{data}\a"] + [""] * max(0, rows - 1)
+        return [
+            f"\x1b]1337;File=inline=1;width={cells};height={rows};preserveAspectRatio=1:{data}\a"
+        ] + [""] * max(0, rows - 1)
 
     def _half_block(self, path: str, cells: int, rows: int) -> list[str]:
         px_w = max(2, cells)
         px_h = max(2, rows * 2)
         try:
             raw = subprocess.check_output(
-                ["ffmpeg", "-loglevel", "quiet", "-i", path, "-vf", f"scale={px_w}:{px_h}", "-f", "rawvideo", "-pix_fmt", "rgba", "-"],
+                [
+                    "ffmpeg",
+                    "-loglevel",
+                    "quiet",
+                    "-i",
+                    path,
+                    "-vf",
+                    f"scale={px_w}:{px_h}",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba",
+                    "-",
+                ],
                 timeout=4,
             )
         except Exception:
@@ -440,7 +491,14 @@ class ArtRenderer:
         return lines
 
     def _placeholder(self, cells: int, rows: int) -> list[str]:
-        return [fg("dim") + "┌" + "─" * max(0, cells - 2) + "┐" + RESET] + [fg("dim") + "│" + " " * max(0, cells - 2) + "│" + RESET for _ in range(max(0, rows - 2))] + [fg("dim") + "└" + "─" * max(0, cells - 2) + "┘" + RESET]
+        return (
+            [fg("dim") + "┌" + "─" * max(0, cells - 2) + "┐" + RESET]
+            + [
+                fg("dim") + "│" + " " * max(0, cells - 2) + "│" + RESET
+                for _ in range(max(0, rows - 2))
+            ]
+            + [fg("dim") + "└" + "─" * max(0, cells - 2) + "┘" + RESET]
+        )
 
 
 @dataclass
@@ -467,7 +525,10 @@ class LyricsState:
                 if ts <= t:
                     idx = i
             start = max(0, idx - height // 2)
-            return [(line, start + n == idx) for n, (_, line) in enumerate(self.lrc[start : start + height])]
+            return [
+                (line, start + n == idx)
+                for n, (_, line) in enumerate(self.lrc[start : start + height])
+            ]
         lines = self.plain or ["No lyrics found"]
         start = max(0, (len(lines) - height) // 2)
         return [(line, False) for line in lines[start : start + height]]
@@ -478,7 +539,12 @@ def parse_lrc(text: str) -> list[tuple[float, str]]:
     for line in text.splitlines():
         match = re.match(r"\[(\d+):(\d+(?:\.\d+)?)\](.*)", line)
         if match:
-            out.append((int(match.group(1)) * 60 + float(match.group(2)), match.group(3).strip()))
+            out.append(
+                (
+                    int(match.group(1)) * 60 + float(match.group(2)),
+                    match.group(3).strip(),
+                )
+            )
     return out
 
 
@@ -600,9 +666,13 @@ class Renderer:
             except Exception:
                 pass
         self.spectrum = make_spectrum(url)
-        self._spectrum_key = ("cava",) if isinstance(self.spectrum, CavaSource) else ("tap", url)
+        self._spectrum_key = (
+            ("cava",) if isinstance(self.spectrum, CavaSource) else ("tap", url)
+        )
 
-    def render_once(self, state: dict[str, Any] | None = None, size: tuple[int, int] | None = None) -> str:
+    def render_once(
+        self, state: dict[str, Any] | None = None, size: tuple[int, int] | None = None
+    ) -> str:
         state = state or read_state(self.state_path)
         self.lyrics.load_from_state(state)
         self.ensure_spectrum(state)
@@ -633,7 +703,11 @@ class Renderer:
             if key == "queue" and self.view == "queue":
                 active = True
             sep = " · " if idx else ""
-            tab_parts.append(sep + (fg("accent") + "•• " + label if active else fg("dim") + label) + RESET)
+            tab_parts.append(
+                sep
+                + (fg("accent") + "•• " + label if active else fg("dim") + label)
+                + RESET
+            )
             if idx == 0 and active:
                 pass
         tabs_str = "".join(tab_parts)
@@ -653,7 +727,9 @@ class Renderer:
             self._draw_now(put, state, left_w + 1, 1, right_w, body_h - 1)
 
         # resilience toast: idle state shows updating hint; drop it once recovered
-        if self.toast == AUTO_HINT and (not self._is_empty_state(state) or self.overlay == "search"):
+        if self.toast == AUTO_HINT and (
+            not self._is_empty_state(state) or self.overlay == "search"
+        ):
             self.toast = ""
         if not self.toast and self._is_empty_state(state) and self.overlay != "search":
             self.toast = AUTO_HINT
@@ -682,15 +758,27 @@ class Renderer:
         self.out.flush()
         return frame
 
-    def _draw_queue(self, canvas: list[str], put: Any, state: dict[str, Any], width: int, height: int) -> None:
+    def _draw_queue(
+        self,
+        canvas: list[str],
+        put: Any,
+        state: dict[str, Any],
+        width: int,
+        height: int,
+    ) -> None:
         queue = state.get("queue") or []
-        current = {"title": state.get("title"), "artist": state.get("artist"), "duration": state.get("duration"), "thumb": state.get("thumb")}
+        current = {
+            "title": state.get("title"),
+            "artist": state.get("artist"),
+            "duration": state.get("duration"),
+            "thumb": state.get("thumb"),
+        }
         items = [current] + list(queue)
         total = len(items)
         pos = 1
         total_sec = int(sum(float(i.get("duration") or 0) for i in items))
         self.selected = max(0, min(self.selected, max(0, total - 1)))
-        put(1, 2, fg("dim") + f"< Library  {pos}/{max(total,1)} · {total_sec}" + RESET)
+        put(1, 2, fg("dim") + f"< Library  {pos}/{max(total, 1)} · {total_sec}" + RESET)
         header = "▸ Play Liked Songs"
         put(2, 2, bg("accent") + fg("bg") + " " + pad(header, width - 4) + " " + RESET)
         y = 3
@@ -699,9 +787,17 @@ class Renderer:
         if not queue and self._is_empty_state(state):
             # show centered illustration hint inside left panel below header
             hint = "♪  Search above to add songs"
-            put(y + avail // 2, 2 + max(0, (width - len(hint)) // 2), fg("dim") + hint + RESET)
+            put(
+                y + avail // 2,
+                2 + max(0, (width - len(hint)) // 2),
+                fg("dim") + hint + RESET,
+            )
             box_hint = fg("dim") + "type to search — results appear instantly" + RESET
-            put(y + avail // 2 + 1, 2 + max(0, (width - cell_len(strip_ansi(box_hint))) // 2), box_hint)
+            put(
+                y + avail // 2 + 1,
+                2 + max(0, (width - cell_len(strip_ansi(box_hint))) // 2),
+                box_hint,
+            )
         for i, item in enumerate(items[:avail]):
             # skip drawing placeholder "MYX/Unknown" when empty state — hint already shown
             if self._is_empty_state(state) and i == 0 and not queue:
@@ -730,46 +826,88 @@ class Renderer:
             put(y, 2, " " + line)
             y += 1
 
-    def _draw_queue_full(self, put: Any, state: dict[str, Any], x: int, y: int, width: int, height: int) -> None:
+    def _draw_queue_full(
+        self, put: Any, state: dict[str, Any], x: int, y: int, width: int, height: int
+    ) -> None:
         queue = state.get("queue") or []
-        current = {"title": state.get("title"), "artist": state.get("artist"), "duration": state.get("duration"), "thumb": state.get("thumb"), "id": state.get("id")}
+        current = {
+            "title": state.get("title"),
+            "artist": state.get("artist"),
+            "duration": state.get("duration"),
+            "thumb": state.get("thumb"),
+            "id": state.get("id"),
+        }
         items = [current] + list(queue)
         self.selected = max(0, min(self.selected, max(0, len(items) - 1)))
         put(y, x, fg("accent") + BOLD + f"Queue — {len(items)} tracks" + RESET)
         if not queue and self._is_empty_state(state):
             hint = "♪  Search above to add songs"
-            put(y + height // 2, x + max(0, (width - len(hint)) // 2), fg("dim") + hint + RESET)
+            put(
+                y + height // 2,
+                x + max(0, (width - len(hint)) // 2),
+                fg("dim") + hint + RESET,
+            )
             return
-        for idx, item in enumerate(items[:height - 2]):
+        for idx, item in enumerate(items[: height - 2]):
             title = str(item.get("title") or "Unknown")
             artist = str(item.get("artist") or "")
             dur = mmss(item.get("duration"))
-            line = f"{idx+1:>2}. {crop(title, max(10, width - 22))}"
+            line = f"{idx + 1:>2}. {crop(title, max(10, width - 22))}"
             if artist:
                 line = pad(line, width - 8) + fg("dim") + crop(artist, 10) + RESET
-            color = bg("accent") + fg("bg") if idx == self.selected else (fg("accent") if idx == 0 else fg("fg"))
-            put(y + 1 + idx, x, color + pad(crop(line, width), width) + fg("dim") + f" {dur}" + RESET)
+            color = (
+                bg("accent") + fg("bg")
+                if idx == self.selected
+                else (fg("accent") if idx == 0 else fg("fg"))
+            )
+            put(
+                y + 1 + idx,
+                x,
+                color + pad(crop(line, width), width) + fg("dim") + f" {dur}" + RESET,
+            )
 
-    def _draw_now(self, put: Any, state: dict[str, Any], x: int, y: int, width: int, height: int) -> None:
+    def _draw_now(
+        self, put: Any, state: dict[str, Any], x: int, y: int, width: int, height: int
+    ) -> None:
         reserved = 12
         art_h = max(6, height - reserved)
         art_cells = min(40, max(12, min(width - 4, art_h * 2)))
         art_rows = max(6, min(art_cells // 2, art_h))
         ax = x + max(0, (width - art_cells) // 2)
         ay = y
-        for n, line in enumerate(self.art.render(state.get("thumb"), art_cells, art_rows)):
+        for n, line in enumerate(
+            self.art.render(state.get("thumb"), art_cells, art_rows)
+        ):
             put(ay + n, ax, line)
         title = str(state.get("title") or "Unknown")
         artist = str(state.get("artist") or "")
-        put(ay + art_rows + 1, x + max(0, (width - min(cell_len(title), width - 2)) // 2), fg("fg") + BOLD + crop(title, width - 2) + RESET)
+        put(
+            ay + art_rows + 1,
+            x + max(0, (width - min(cell_len(title), width - 2)) // 2),
+            fg("fg") + BOLD + crop(title, width - 2) + RESET,
+        )
         if artist:
-            put(ay + art_rows + 2, x + max(0, (width - min(cell_len(artist), width - 2)) // 2), fg("dim") + crop(artist, width - 2) + RESET)
+            put(
+                ay + art_rows + 2,
+                x + max(0, (width - min(cell_len(artist), width - 2)) // 2),
+                fg("dim") + crop(artist, width - 2) + RESET,
+            )
         pos = float(state.get("position") or 0)
         dur = float(state.get("duration") or 0)
         bar_w = max(10, width - 16)
         fill = int((pos / dur) * bar_w) if dur else 0
         bar = "─" * max(0, fill) + "o" + "─" * max(0, bar_w - fill - 1)
-        put(ay + art_rows + 4, x + max(0, (width - (bar_w + 10)) // 2), fg("dim") + f"{mmss(pos)} " + fg("accent") + bar + fg("dim") + f" {mmss(dur)}" + RESET)
+        put(
+            ay + art_rows + 4,
+            x + max(0, (width - (bar_w + 10)) // 2),
+            fg("dim")
+            + f"{mmss(pos)} "
+            + fg("accent")
+            + bar
+            + fg("dim")
+            + f" {mmss(dur)}"
+            + RESET,
+        )
         vals, peaks = self.spectrum.values_with_peaks()
         base = y + height - 1
         # spectrum lives strictly below the progress bar row
@@ -800,15 +938,23 @@ class Renderer:
                 parts.append(" ")
             put(r, start_x, "".join(parts) + RESET)
 
-    def _draw_lyrics(self, put: Any, state: dict[str, Any], x: int, y: int, width: int, height: int) -> None:
+    def _draw_lyrics(
+        self, put: Any, state: dict[str, Any], x: int, y: int, width: int, height: int
+    ) -> None:
         lines = self.lyrics.visible(float(state.get("position") or 0), height)
         start_y = y + max(0, (height - len(lines)) // 2)
         for n, (line, active) in enumerate(lines):
             color = fg("accent") + BOLD if active else fg("fg")
-            put(start_y + n, x + max(0, (width - cell_len(line)) // 2), color + crop(line, width) + RESET)
+            put(
+                start_y + n,
+                x + max(0, (width - cell_len(line)) // 2),
+                color + crop(line, width) + RESET,
+            )
 
     # -- picker overlays --
-    def _overlay_box(self, put: Any, cols: int, rows: int, w: int, h: int) -> tuple[int, int]:
+    def _overlay_box(
+        self, put: Any, cols: int, rows: int, w: int, h: int
+    ) -> tuple[int, int]:
         """Compute centered box origin; caller draws border/content."""
         w = min(w, cols - 4)
         h = min(h, rows - 4)
@@ -830,7 +976,17 @@ class Renderer:
         x, y = self._overlay_box(put, cols, rows, w, h)
         inner_w = w - 4
         # title
-        put(y + 1, x + 2, fg("accent") + BOLD + "Search" + RESET + fg("dim") + "  ·  type to filter, enter to play, esc to close" + RESET)
+        put(
+            y + 1,
+            x + 2,
+            fg("accent")
+            + BOLD
+            + "Search"
+            + RESET
+            + fg("dim")
+            + "  ·  type to filter, enter to play, esc to close"
+            + RESET,
+        )
         # input field
         query_disp = self.picker.query if self.picker.query else ""
         placeholder = "Search for songs, artists..." if not query_disp else ""
@@ -838,7 +994,21 @@ class Renderer:
         field_text = f"Search › {query_disp}{cursor}"
         if placeholder and not query_disp:
             field_text = f"Search › {fg('dim')}{placeholder}{RESET}"
-        put(y + 2, x + 2, bg("accent") + fg("bg") + " " + pad(crop(strip_ansi(field_text) if placeholder else field_text, inner_w - 2), inner_w - 2) + " " + RESET)
+        put(
+            y + 2,
+            x + 2,
+            bg("accent")
+            + fg("bg")
+            + " "
+            + pad(
+                crop(
+                    strip_ansi(field_text) if placeholder else field_text, inner_w - 2
+                ),
+                inner_w - 2,
+            )
+            + " "
+            + RESET,
+        )
         # status line
         status = ""
         if self.picker.loading:
@@ -848,11 +1018,23 @@ class Renderer:
         elif self._search_note:
             status = fg("accent") + crop(self._search_note, inner_w) + RESET
         elif self.picker.query and not self.picker.results:
-            status = fg("dim") + f"No results for '{crop(self.picker.query, 20)}' — try another search" + RESET
+            status = (
+                fg("dim")
+                + f"No results for '{crop(self.picker.query, 20)}' — try another search"
+                + RESET
+            )
         elif self.picker.results:
-            status = fg("dim") + f"{len(self.picker.results)} results  ·  ↑↓ navigate  ·  enter play" + RESET
+            status = (
+                fg("dim")
+                + f"{len(self.picker.results)} results  ·  ↑↓ navigate  ·  enter play"
+                + RESET
+            )
         else:
-            status = fg("dim") + "Type to search YouTube / YT Music — results appear instantly" + RESET
+            status = (
+                fg("dim")
+                + "Type to search YouTube / YT Music — results appear instantly"
+                + RESET
+            )
         put(y + 3, x + 2, status)
         # results list
         avail = h - 6
@@ -884,7 +1066,16 @@ class Renderer:
             line = pad(base, allow) + " " + fg("dim") + dur + RESET
             is_sel = ri == self.picker.selected
             if is_sel:
-                put(y + 4 + idx, x + 2, bg("accent") + fg("bg") + " " + pad(crop(strip_ansi(line), inner_w - 2), inner_w - 2) + " " + RESET)
+                put(
+                    y + 4 + idx,
+                    x + 2,
+                    bg("accent")
+                    + fg("bg")
+                    + " "
+                    + pad(crop(strip_ansi(line), inner_w - 2), inner_w - 2)
+                    + " "
+                    + RESET,
+                )
             else:
                 put(y + 4 + idx, x + 2, " " + line)
 
@@ -895,14 +1086,38 @@ class Renderer:
         h = max(8, min(h, rows - 4))
         x, y = self._overlay_box(put, cols, rows, w, h)
         inner_w = w - 4
-        put(y + 1, x + 2, fg("accent") + BOLD + "Command Palette" + RESET + fg("dim") + "  ·  ctrl-k / ?  ·  esc to close" + RESET)
+        put(
+            y + 1,
+            x + 2,
+            fg("accent")
+            + BOLD
+            + "Command Palette"
+            + RESET
+            + fg("dim")
+            + "  ·  ctrl-k / ?  ·  esc to close"
+            + RESET,
+        )
         qdisp = self.command_query or ""
         placeholder = "Type a command..." if not qdisp else ""
         field = f"› {qdisp}▌" if qdisp else f"› {fg('dim')}{placeholder}{RESET}"
-        put(y + 2, x + 2, bg("accent") + fg("bg") + " " + pad(crop(strip_ansi(field) if not qdisp else field, inner_w - 2), inner_w - 2) + " " + RESET)
+        put(
+            y + 2,
+            x + 2,
+            bg("accent")
+            + fg("bg")
+            + " "
+            + pad(
+                crop(strip_ansi(field) if not qdisp else field, inner_w - 2),
+                inner_w - 2,
+            )
+            + " "
+            + RESET,
+        )
         avail = h - 5
         # clamp selection
-        self.command_selected = max(0, min(self.command_selected, max(0, len(filtered) - 1)))
+        self.command_selected = max(
+            0, min(self.command_selected, max(0, len(filtered) - 1))
+        )
         start = max(0, self.command_selected - avail // 2)
         for idx in range(avail):
             fi = start + idx
@@ -915,7 +1130,16 @@ class Renderer:
             line = pad(line, inner_w - 12) + fg("dim") + crop(keys, 10) + RESET
             is_sel = fi == self.command_selected
             if is_sel:
-                put(y + 3 + idx, x + 2, bg("accent") + fg("bg") + " " + pad(crop(strip_ansi(line), inner_w - 2), inner_w - 2) + " " + RESET)
+                put(
+                    y + 3 + idx,
+                    x + 2,
+                    bg("accent")
+                    + fg("bg")
+                    + " "
+                    + pad(crop(strip_ansi(line), inner_w - 2), inner_w - 2)
+                    + " "
+                    + RESET,
+                )
             else:
                 put(y + 3 + idx, x + 2, " " + line)
 
@@ -924,7 +1148,17 @@ class Renderer:
         h = min(22, rows - 4)
         x, y = self._overlay_box(put, cols, rows, w, h)
         inner_w = w - 4
-        put(y + 1, x + 2, fg("accent") + BOLD + "Help  ·  MYX Tour" + RESET + fg("dim") + "  ·  ? / esc to close" + RESET)
+        put(
+            y + 1,
+            x + 2,
+            fg("accent")
+            + BOLD
+            + "Help  ·  MYX Tour"
+            + RESET
+            + fg("dim")
+            + "  ·  ? / esc to close"
+            + RESET,
+        )
         # tour steps
         line_y = y + 2
         for step in TOUR_STEPS:
@@ -955,7 +1189,15 @@ class Renderer:
         for kb in KEYBINDS[: max(0, y + h - 1 - line_y)]:
             keys = kb.get("keys", "")
             desc = kb.get("desc", "")
-            put(line_y, x + 2, fg("fg") + pad(crop(keys, 18), 18) + fg("dim") + crop(desc, inner_w - 20) + RESET)
+            put(
+                line_y,
+                x + 2,
+                fg("fg")
+                + pad(crop(keys, 18), 18)
+                + fg("dim")
+                + crop(desc, inner_w - 20)
+                + RESET,
+            )
             line_y += 1
 
     # -- key handling --
@@ -1001,13 +1243,21 @@ class Renderer:
                     self.close_overlay()
                 elif q:
                     try:
-                        fn = self.search_fn or (lambda qq: send_command("search", arg=qq))
+                        fn = self.search_fn or (
+                            lambda qq: send_command("search", arg=qq)
+                        )
                         resp = fn(q)
                         if isinstance(resp, dict) and resp.get("ok") is False:
                             self.toast = str(resp.get("error") or "search failed")
                         else:
-                            queued = resp.get("queued") if isinstance(resp, dict) else None
-                            self.toast = f"queued {queued}" if queued is not None else f"queued: {q}"
+                            queued = (
+                                resp.get("queued") if isinstance(resp, dict) else None
+                            )
+                            self.toast = (
+                                f"queued {queued}"
+                                if queued is not None
+                                else f"queued: {q}"
+                            )
                             self.close_overlay()
                     except Exception as exc:
                         self.toast = str(exc)
@@ -1050,7 +1300,9 @@ class Renderer:
             return True
         if key in ("\x1b[B", "j"):
             filtered = command_palette_search(self.command_query)
-            self.command_selected = min(max(0, len(filtered) - 1), self.command_selected + 1)
+            self.command_selected = min(
+                max(0, len(filtered) - 1), self.command_selected + 1
+            )
             return True
         if key in ("\r", "\n"):
             filtered = command_palette_search(self.command_query)
@@ -1139,7 +1391,21 @@ class Renderer:
             # they have explicit UX and tests expect them to work. Only non-command
             # printable chars auto-open search. In empty state this still gives
             # "type to search" front-door for letters/digits/symbols.
-            known_cmds = {"q", "n", "p", "s", "l", "d", "+", "-", "=", "[", "]", "j", "k"}
+            known_cmds = {
+                "q",
+                "n",
+                "p",
+                "s",
+                "l",
+                "d",
+                "+",
+                "-",
+                "=",
+                "[",
+                "]",
+                "j",
+                "k",
+            }
             if key in known_cmds:
                 pass
             else:
@@ -1188,7 +1454,10 @@ class Renderer:
                     # double-press to confirm within 2s
                     now = time.monotonic()
                     idx = self.selected - 1
-                    if self._pending_delete_idx == idx and (now - self._delete_confirm_time) < 2.0:
+                    if (
+                        self._pending_delete_idx == idx
+                        and (now - self._delete_confirm_time) < 2.0
+                    ):
                         send_command("del", arg=idx)
                         self.selected = max(0, self.selected - 1)
                         self._pending_delete_idx = None

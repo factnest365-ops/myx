@@ -59,9 +59,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     argv = sys.argv[1:] if argv is None else argv
     if not argv:
         return argparse.Namespace(
-            url=None, search=None, lyrics_only=False, state=False, no_lyrics=False,
-            subcommand=None, stdio=False, fix=False,
-            quit=False, skip=False, prev=False, toggle=False, vol=None,
+            url=None,
+            search=None,
+            lyrics_only=False,
+            state=False,
+            no_lyrics=False,
+            subcommand=None,
+            stdio=False,
+            fix=False,
+            quit=False,
+            skip=False,
+            prev=False,
+            toggle=False,
+            vol=None,
         )
 
     # If first arg looks like a URL/ID, treat as seed url (not subcommand)
@@ -74,7 +84,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.add_argument("--lyrics-only", action="store_true")
         parser.add_argument("--state", action="store_true")
         parser.add_argument("--no-lyrics", action="store_true")
-        parser.add_argument("--quit", action="store_true", help="Stop playback and exit daemon")
+        parser.add_argument(
+            "--quit", action="store_true", help="Stop playback and exit daemon"
+        )
         parser.add_argument("--skip", action="store_true", help="Skip to next track")
         parser.add_argument("--prev", action="store_true", help="Go to previous track")
         parser.add_argument("--toggle", action="store_true", help="Toggle pause/play")
@@ -91,19 +103,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="myx")
     parser.add_argument("url", nargs="?", help="YouTube or YT Music URL/video id seed")
     parser.add_argument("--search", help="Open search results into the queue")
-    parser.add_argument("--lyrics-only", action="store_true", help="Developer aid: start in lyrics view")
-    parser.add_argument("--state", action="store_true", help="Print current player state as JSON and exit (agent-friendly)")
-    parser.add_argument("--no-lyrics", action="store_true", help="Battery/memory saver: skip lyrics fetch (headless/agent mode)")
-    parser.add_argument("--quit", action="store_true", help="Stop playback and exit daemon")
+    parser.add_argument(
+        "--lyrics-only", action="store_true", help="Developer aid: start in lyrics view"
+    )
+    parser.add_argument(
+        "--state",
+        action="store_true",
+        help="Print current player state as JSON and exit (agent-friendly)",
+    )
+    parser.add_argument(
+        "--no-lyrics",
+        action="store_true",
+        help="Battery/memory saver: skip lyrics fetch (headless/agent mode)",
+    )
+    parser.add_argument(
+        "--quit", action="store_true", help="Stop playback and exit daemon"
+    )
     parser.add_argument("--skip", action="store_true", help="Skip to next track")
     parser.add_argument("--prev", action="store_true", help="Go to previous track")
     parser.add_argument("--toggle", action="store_true", help="Toggle pause/play")
     parser.add_argument("--vol", type=int, help="Set volume 0-100")
     sub = parser.add_subparsers(dest="subcommand")
-    mcp_p = sub.add_parser("mcp", help="Run MYX as an MCP server over stdio (for agents)")
-    mcp_p.add_argument("--stdio", action="store_true", help="Use stdio transport (default)")
+    mcp_p = sub.add_parser(
+        "mcp", help="Run MYX as an MCP server over stdio (for agents)"
+    )
+    mcp_p.add_argument(
+        "--stdio", action="store_true", help="Use stdio transport (default)"
+    )
     doc_p = sub.add_parser("doctor", help="Check setup and daemon health")
-    doc_p.add_argument("--fix", action="store_true", help="Attempt to auto-fix issues (brew install/upgrade, stale lock cleanup)")
+    doc_p.add_argument(
+        "--fix",
+        action="store_true",
+        help="Attempt to auto-fix issues (brew install/upgrade, stale lock cleanup)",
+    )
     return parser.parse_args(argv)
 
 
@@ -151,7 +183,9 @@ def doctor_check() -> dict:
 
     # yt-dlp staleness
     yt_version = bins.get("yt-dlp", {}).get("version")
-    yt_dlp_stale = bool(bins.get("yt-dlp", {}).get("installed") and _yt_dlp_stale(yt_version))
+    yt_dlp_stale = bool(
+        bins.get("yt-dlp", {}).get("installed") and _yt_dlp_stale(yt_version)
+    )
 
     # daemon health
     socket_exists = CMD_SOCK.exists()
@@ -198,11 +232,15 @@ def doctor_check() -> dict:
 
 
 def _print_doctor(report: dict, fix: bool = False) -> int:
-    missing = [name for name, info in report.get("bins", {}).items() if not info.get("installed")]
+    missing = [
+        name
+        for name, info in report.get("bins", {}).items()
+        if not info.get("installed")
+    ]
     brew_available = report.get("brew_available", False)
 
     print(f"{_BOLD}MYX doctor{_RESET}")
-    print("")
+    print()
     # bins
     for name in ("mpv", "yt-dlp", "ffmpeg"):
         info = report.get(name) or report.get("bins", {}).get(name, {})
@@ -217,7 +255,9 @@ def _print_doctor(report: dict, fix: bool = False) -> int:
 
     # yt-dlp staleness
     if report.get("yt_dlp_stale") or report.get("yt-dlp_stale"):
-        print(f"  yt-dlp: {_YELLOW}stale{_RESET} — yt-dlp is older than 30 days; run `brew upgrade yt-dlp` or `yt-dlp -U`" )
+        print(
+            f"  yt-dlp: {_YELLOW}stale{_RESET} — yt-dlp is older than 30 days; run `brew upgrade yt-dlp` or `yt-dlp -U`"
+        )
     else:
         # only warn if installed and stale check passed; otherwise silent
         pass
@@ -227,7 +267,9 @@ def _print_doctor(report: dict, fix: bool = False) -> int:
     if daemon.get("healthy"):
         print(f"  daemon: {_GREEN}healthy{_RESET} (pid {daemon.get('lock_pid')})")
     elif daemon.get("stale_lock"):
-        print(f"  daemon: {_YELLOW}stale lock{_RESET} (pid {daemon.get('lock_pid')} not running)")
+        print(
+            f"  daemon: {_YELLOW}stale lock{_RESET} (pid {daemon.get('lock_pid')} not running)"
+        )
     else:
         if daemon.get("socket_exists") or daemon.get("lock_pid") is not None:
             print(f"  daemon: {_DIM}not running{_RESET}")
@@ -247,7 +289,10 @@ def _print_doctor(report: dict, fix: bool = False) -> int:
                 print(f"  try manually: `{brew_cmd}`")
         else:
             if brew_available:
-                print(f"\n  fix: `{brew_cmd}`" + (" (run `myx doctor --fix` to auto-install)" if not fix else ""))
+                print(
+                    f"\n  fix: `{brew_cmd}`"
+                    + (" (run `myx doctor --fix` to auto-install)" if not fix else "")
+                )
             else:
                 print(f"\n  fix: install missing bins: {', '.join(missing)}")
                 print(f"       macOS: `{brew_cmd}`")
@@ -255,19 +300,19 @@ def _print_doctor(report: dict, fix: bool = False) -> int:
     if report.get("yt_dlp_stale") or report.get("yt-dlp_stale"):
         if fix:
             if brew_available:
-                print(f"  fixing yt-dlp: `brew upgrade yt-dlp` ...")
+                print("  fixing yt-dlp: `brew upgrade yt-dlp` ...")
                 try:
                     subprocess.run(["brew", "upgrade", "yt-dlp"], timeout=120)
                 except Exception as exc:
                     print(f"  brew upgrade failed: {exc} — try `yt-dlp -U`")
             else:
-                print(f"  fix yt-dlp: `yt-dlp -U`")
+                print("  fix yt-dlp: `yt-dlp -U`")
                 try:
                     subprocess.run(["yt-dlp", "-U"], timeout=60)
                 except Exception:
                     pass
         else:
-            print(f"  hint: update yt-dlp via `brew upgrade yt-dlp` or `yt-dlp -U`")
+            print("  hint: update yt-dlp via `brew upgrade yt-dlp` or `yt-dlp -U`")
 
     if daemon.get("stale_lock"):
         if fix:
@@ -277,7 +322,9 @@ def _print_doctor(report: dict, fix: bool = False) -> int:
             except Exception as exc:
                 print(f"  failed to clean lockfile: {exc}")
         else:
-            print(f"  hint: stale lock at {LOCK_PATH} — run `myx doctor --fix` to clean up")
+            print(
+                f"  hint: stale lock at {LOCK_PATH} — run `myx doctor --fix` to clean up"
+            )
 
     # overall status line
     has_issue = bool(missing or report.get("yt_dlp_stale") or daemon.get("stale_lock"))
@@ -300,7 +347,9 @@ def check_bins() -> None:
     if missing:
         hints = "; ".join(REQUIRED_BINS[name] for name in missing)
         # Friendly error that points to doctor
-        raise SystemExit(f"missing required binary: {', '.join(missing)}. {hints} — run `myx doctor` for setup help")
+        raise SystemExit(
+            f"missing required binary: {', '.join(missing)}. {hints} — run `myx doctor` for setup help"
+        )
 
 
 def _pid_running(pid: int) -> bool:
@@ -352,7 +401,9 @@ def _read_live_state() -> dict:
 SOCK_WAIT_S = 5.0
 
 
-def _wait_for_cmd_sock(proc: subprocess.Popen[str] | None = None, timeout: float = SOCK_WAIT_S) -> bool:
+def _wait_for_cmd_sock(
+    proc: subprocess.Popen[str] | None = None, timeout: float = SOCK_WAIT_S
+) -> bool:
     """Poll until the daemon's command socket exists.
 
     ``proc`` (when we spawned the daemon) lets us bail out early if it dies.
@@ -370,7 +421,9 @@ def _wait_for_cmd_sock(proc: subprocess.Popen[str] | None = None, timeout: float
     return CMD_SOCK.exists()
 
 
-def boot_daemon(seed: str | None = None, no_lyrics: bool = False) -> subprocess.Popen[str] | None:
+def boot_daemon(
+    seed: str | None = None, no_lyrics: bool = False
+) -> subprocess.Popen[str] | None:
     if read_lock():
         # A live daemon process exists (booting or running). Never spawn a
         # second one — that races the singleton lock and double-plays audio.
@@ -385,7 +438,9 @@ def boot_daemon(seed: str | None = None, no_lyrics: bool = False) -> subprocess.
     if no_lyrics:
         args.append("--no-lyrics")
     env = {**os.environ, "MYX_NO_LYRICS": "1"} if no_lyrics else None
-    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, env=env)
+    proc = subprocess.Popen(
+        args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, env=env
+    )
     write_lock(proc.pid)
     return proc
 
@@ -416,6 +471,7 @@ def main(argv: list[str] | None = None) -> int:
     # Agent-native entrypoints — no bin checks, no TUI needed
     if getattr(args, "subcommand", None) == "mcp":
         from .mcp import serve_stdio
+
         return serve_stdio()
     if getattr(args, "state", False):
         print(json.dumps(_read_live_state()))

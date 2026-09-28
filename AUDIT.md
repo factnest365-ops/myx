@@ -48,4 +48,4 @@
 
 ## Audit Round 2 (2026-09-28)
 
-BUG-004..BUG-022 found and fixed with focused hermetic regression tests; see table. Spectrum wiring (BUG-005/006) also fixed peak-hold initialization.
+BUG-004..BUG-022 were audited with focused hermetic regression tests; BUG-008 was disproved and dropped, while the remaining confirmed findings were fixed. Spectrum wiring (BUG-005/006) also fixed peak-hold initialization.
