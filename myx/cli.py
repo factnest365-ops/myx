@@ -58,7 +58,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse args with custom logic to allow URL as first positional arg alongside subcommands."""
     argv = sys.argv[1:] if argv is None else argv
     if not argv:
-        return argparse.Namespace(url=None, search=None, lyrics_only=False, state=False, no_lyrics=False, subcommand=None, stdio=False, fix=False)
+        return argparse.Namespace(
+            url=None, search=None, lyrics_only=False, state=False, no_lyrics=False,
+            subcommand=None, stdio=False, fix=False,
+            quit=False, skip=False, prev=False, toggle=False, vol=None,
+        )
 
     # If first arg looks like a URL/ID, treat as seed url (not subcommand)
     first = argv[0]
@@ -70,6 +74,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.add_argument("--lyrics-only", action="store_true")
         parser.add_argument("--state", action="store_true")
         parser.add_argument("--no-lyrics", action="store_true")
+        parser.add_argument("--quit", action="store_true", help="Stop playback and exit daemon")
+        parser.add_argument("--skip", action="store_true", help="Skip to next track")
+        parser.add_argument("--prev", action="store_true", help="Go to previous track")
+        parser.add_argument("--toggle", action="store_true", help="Toggle pause/play")
+        parser.add_argument("--vol", type=int, help="Set volume 0-100")
         parser.add_argument("-h", "--help", action="help")
         args = parser.parse_args(argv)
         args.subcommand = None
@@ -77,7 +86,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.fix = False
         return args
 
-# First arg is a subcommand (mcp, doctor) or a flag
+    # First arg is a subcommand (mcp, doctor) or a flag
     # Use full parser with subcommands, but make url optional and only used when there's no subcommand
     parser = argparse.ArgumentParser(prog="myx")
     parser.add_argument("url", nargs="?", help="YouTube or YT Music URL/video id seed")
@@ -85,6 +94,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lyrics-only", action="store_true", help="Developer aid: start in lyrics view")
     parser.add_argument("--state", action="store_true", help="Print current player state as JSON and exit (agent-friendly)")
     parser.add_argument("--no-lyrics", action="store_true", help="Battery/memory saver: skip lyrics fetch (headless/agent mode)")
+    parser.add_argument("--quit", action="store_true", help="Stop playback and exit daemon")
+    parser.add_argument("--skip", action="store_true", help="Skip to next track")
+    parser.add_argument("--prev", action="store_true", help="Go to previous track")
+    parser.add_argument("--toggle", action="store_true", help="Toggle pause/play")
+    parser.add_argument("--vol", type=int, help="Set volume 0-100")
     sub = parser.add_subparsers(dest="subcommand")
     mcp_p = sub.add_parser("mcp", help="Run MYX as an MCP server over stdio (for agents)")
     mcp_p.add_argument("--stdio", action="store_true", help="Use stdio transport (default)")
@@ -396,6 +410,32 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "subcommand", None) == "doctor":
         fix = bool(getattr(args, "fix", False))
         return run_doctor(fix=fix)
+
+    # Headless control flags — send command to daemon and exit
+    headless_cmd = None
+    if getattr(args, "quit", False):
+        headless_cmd = ("quit", None)
+    elif getattr(args, "skip", False):
+        headless_cmd = ("skip", None)
+    elif getattr(args, "prev", False):
+        headless_cmd = ("prev", None)
+    elif getattr(args, "toggle", False):
+        headless_cmd = ("toggle", None)
+    elif getattr(args, "vol", None) is not None:
+        headless_cmd = ("vol", args.vol)
+
+    if headless_cmd:
+        # These work against a running daemon; no bin checks needed
+        if not daemon_running():
+            print("daemon not running", file=sys.stderr)
+            return 1
+        try:
+            tui.send_command(headless_cmd[0], arg=headless_cmd[1])
+            return 0
+        except Exception as exc:
+            print(f"command failed: {exc}", file=sys.stderr)
+            return 1
+
     check_bins()
     # if daemon already running and a seed url was given, append it instead of ignoring
     already = daemon_running()

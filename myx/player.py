@@ -123,25 +123,37 @@ class PlayerDaemon:
             pass
         self._spawn_mpv()
         self._wait_for_socket(MPV_SOCK)
-        # Service threads first: the command socket and state file must come up
-        # before seed stream resolution (network, can take seconds), otherwise
-        # the CLI/TUI/MCP cannot talk to us during the whole boot window.
-        threads = [
-            threading.Thread(target=self._command_server, daemon=True),
-            threading.Thread(target=self._refill_loop, daemon=True),
-            threading.Thread(target=self._state_loop, daemon=True),
-            threading.Thread(target=self._queue_hydration_loop, daemon=True),
-            threading.Thread(target=self._healthcheck_loop, daemon=True),
-        ]
-        for t in threads:
-            t.start()
+        # Start command server and refill loop first — they must be responsive
+        # for CLI/TUI/MCP. Seed resolution (with metadata fetch) happens next
+        # so the first state write has correct title/artist.
+        self._command_server_thread = threading.Thread(target=self._command_server, daemon=True)
+        self._refill_loop_thread = threading.Thread(target=self._refill_loop, daemon=True)
+        self._command_server_thread.start()
+        self._refill_loop_thread.start()
         try:
             if self.url:
                 seed_vid = _video_id(self.url)
                 if seed_vid:
                     self._play_now(seed_vid)
                 else:
+                    # Fallback: load URL directly and try to extract metadata from it
                     self._mpv(["loadfile", self.url, "replace"])
+                    # Best effort: try to extract video ID from URL for metadata
+                    fallback_vid = _video_id(self.url)
+                    if fallback_vid:
+                        try:
+                            self._current_meta = sources.meta(fallback_vid)
+                        except sources.SourcesError:
+                            self._current_meta = {}
+        finally:
+            # Now start remaining service threads
+            self._state_loop_thread = threading.Thread(target=self._state_loop, daemon=True)
+            self._queue_hydration_loop_thread = threading.Thread(target=self._queue_hydration_loop, daemon=True)
+            self._healthcheck_loop_thread = threading.Thread(target=self._healthcheck_loop, daemon=True)
+            self._state_loop_thread.start()
+            self._queue_hydration_loop_thread.start()
+            self._healthcheck_loop_thread.start()
+        try:
             while not self.stop.is_set():
                 if self.mpv and self.mpv.poll() is not None:
                     break
@@ -162,6 +174,11 @@ class PlayerDaemon:
             except subprocess.TimeoutExpired:
                 self.mpv.kill()
         self._cleanup_sockets()
+        # Remove state file so dead daemon cannot report stale playing state
+        try:
+            STATE_PATH.unlink(missing_ok=True)
+        except Exception:
+            pass
         try:
             (TMPDIR / "myx.lock").unlink()
         except Exception:
