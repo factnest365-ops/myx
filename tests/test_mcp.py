@@ -41,6 +41,7 @@ def test_mcp_stdio_roundtrip():
         capture_output=True,
         text=True,
         timeout=5,
+        check=False,
     )
     assert proc.returncode == 0
     lines = [
@@ -67,6 +68,7 @@ def _run_stdio(payload: str) -> list:
         capture_output=True,
         text=True,
         timeout=5,
+        check=False,
     )
     assert proc.returncode == 0, proc.stderr
     return [json.loads(l) for l in proc.stdout.splitlines() if l.strip()]

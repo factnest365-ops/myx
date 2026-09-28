@@ -42,6 +42,7 @@
 - Partial escape-key sequences (e.g. `\x1b[1;5C` from modified arrows) leave one junk char that can auto-open search — unproven real-world impact, not fixed
 - Spectrum is skipped entirely when fewer than 3 rows fit below the progress bar (rows <= ~15)
 - Divider/`_draw_queue_full` row styles can still lose colors across multiple puts on one row (same class as BUG-015, not yet swept)
+- Ruff broad-exception and try/except/pass findings predate this audit and are not part of the project CI contract; leave for a separate error-handling cleanup.
 
 ---
 *Audit started: 2026-09-28*

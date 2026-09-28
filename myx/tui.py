@@ -663,7 +663,7 @@ class Renderer:
         if self._spectrum_key is not None:
             try:
                 self.spectrum.close()
-            except Exception:
+            except Exception:  # noqa: BLE001 - plugin cleanup must not kill the TUI
                 pass
         self.spectrum = make_spectrum(url)
         self._spectrum_key = (

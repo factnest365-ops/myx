@@ -531,7 +531,7 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
         else:
             return _tool_error(f"unknown tool: {name}")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - convert all handler failures to JSON-RPC errors
         return _tool_error(str(e))
 
 

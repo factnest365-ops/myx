@@ -191,7 +191,7 @@ class PlayerDaemon:
         # Remove state file so dead daemon cannot report stale playing state
         try:
             STATE_PATH.unlink(missing_ok=True)
-        except Exception:
+        except OSError:
             pass
         try:
             (TMPDIR / "myx.lock").unlink()
@@ -266,7 +266,7 @@ class PlayerDaemon:
         # identical to append (verified against the mpv manual).
         try:
             idle = not self._playlist()
-        except Exception:
+        except Exception:  # noqa: BLE001 - an IPC failure must not stop shutdown
             idle = False
         self._mpv(["loadfile", stream, "append-play" if idle else "append"])
         self._id_by_path[stream] = video_id

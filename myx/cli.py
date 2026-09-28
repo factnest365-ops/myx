@@ -49,9 +49,7 @@ def _looks_like_url_or_id(arg: str) -> bool:
         return True
     # bare video ID: alphanumeric + _ -, 11 chars typical but accept 6+
     # but exclude common words that could be subcommands
-    if re.fullmatch(r"[A-Za-z0-9_-]{6,}", arg):
-        return True
-    return False
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]{6,}", arg))
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -501,7 +499,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             tui.send_command(headless_cmd[0], arg=headless_cmd[1])
             return 0
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             print(f"command failed: {exc}", file=sys.stderr)
             return 1
 
