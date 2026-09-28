@@ -412,13 +412,76 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return _tool_error(str(e))
 
 
-def _write(obj: dict[str, Any]) -> None:
+def _write(obj: Any) -> None:
     sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
     sys.stdout.flush()
 
 
+def _rpc_reply(mid: Any, result: Any) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": mid, "result": result}
+
+
+def _rpc_error(mid: Any, code: int, message: str) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": mid, "error": {"code": code, "message": message}}
+
+
+def _dispatch(msg: Any) -> dict[str, Any] | None:
+    """Handle one decoded JSON-RPC message.
+
+    Returns the response object, or None when no response is due
+    (notifications per JSON-RPC 2.0 MUST NOT be answered).
+    """
+    if not isinstance(msg, dict):
+        return _rpc_error(None, -32600, "Invalid Request")
+    mid = msg.get("id")
+    has_id = "id" in msg
+    method = msg.get("method")
+    if not isinstance(method, str):
+        return _rpc_error(mid, -32600, "Invalid Request")
+    notification = not has_id
+    try:
+        if method == "initialize":
+            resp = _rpc_reply(mid, {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+            })
+            _write({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+            return None if notification else resp
+        if method.startswith("notifications/"):
+            return None
+        if method == "tools/list":
+            resp = _rpc_reply(mid, {"tools": TOOLS})
+            return None if notification else resp
+        if method == "tools/call":
+            params = msg.get("params") or {}
+            name = params.get("name")
+            args = params.get("arguments") or {}
+            resp = _rpc_reply(mid, handle_tool(name, args))
+            return None if notification else resp
+        if method == "ping":
+            resp = _rpc_reply(mid, {})
+            return None if notification else resp
+        if method == "shutdown":
+            resp = _rpc_reply(mid, {})
+            return None if notification else resp
+        # Unknown method: -32601; notifications stay unanswered.
+        if notification:
+            return None
+        return _rpc_error(mid, -32601, f"Method not found: {method}")
+    except Exception as e:
+        if not has_id:
+            return None
+        return _rpc_error(mid, -32603, str(e))
+
+
 def serve_stdio() -> int:
-    """Run MCP JSON-RPC 2.0 over stdio. Handles initialize, tools/list, tools/call, ping, shutdown."""
+    """Run MCP JSON-RPC 2.0 over stdio.
+
+    Handles initialize, tools/list, tools/call, ping, shutdown; batch
+    requests (JSON-RPC 2.0 §6), parse errors (-32700), invalid requests
+    (-32600), and notifications (never answered).
+    """
     for raw in sys.stdin:
         line = raw.strip()
         if not line:
@@ -426,46 +489,24 @@ def serve_stdio() -> int:
         try:
             msg = json.loads(line)
         except Exception:
+            _write(_rpc_error(None, -32700, "Parse error"))
             continue
-        mid = msg.get("id")
-        method = msg.get("method")
-
-        def reply(result: Any) -> None:
-            _write({"jsonrpc": "2.0", "id": mid, "result": result})
-
-        def error(code: int, message: str) -> None:
-            _write({"jsonrpc": "2.0", "id": mid, "error": {"code": code, "message": message}})
-
-        try:
-            if method == "initialize":
-                reply({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-                })
-                _write({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
-            elif method == "notifications/initialized":
-                pass
-            elif method == "tools/list":
-                reply({"tools": TOOLS})
-            elif method == "tools/call":
-                params = msg.get("params") or {}
-                name = params.get("name")
-                args = params.get("arguments") or {}
-                result = handle_tool(name, args)
-                reply(result)
-            elif method == "ping":
-                reply({})
-            elif method == "shutdown":
-                reply({})
-                break
-            elif method is None:
-                error(-32600, "Invalid Request")
-            else:
-                error(-32601, f"Method not found: {method}")
-        except Exception as e:
-            if mid is not None:
-                error(-32603, str(e))
+        items = msg if isinstance(msg, list) else [msg]
+        responses: list[dict[str, Any]] = []
+        shutdown = False
+        for item in items:
+            resp = _dispatch(item)
+            if resp is not None:
+                responses.append(resp)
+            if isinstance(item, dict) and item.get("method") == "shutdown":
+                shutdown = True
+        if isinstance(msg, list):
+            if responses:
+                _write(responses)
+        elif responses:
+            _write(responses[0])
+        if shutdown:
+            break
     return 0
 
 
