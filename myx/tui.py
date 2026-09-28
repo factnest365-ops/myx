@@ -530,8 +530,6 @@ class Renderer:
         state = state or read_state(self.state_path)
         self.lyrics.load_from_state(state)
         cols, rows = size or shutil.get_terminal_size((100, 32))
-        cols = max(60, cols)
-        rows = max(20, rows)
         left_w = max(24, int(cols * 0.38))
         right_w = cols - left_w - 1
         body_h = rows - 3
@@ -695,6 +693,9 @@ class Renderer:
         vals, peaks = self.spectrum.values_with_peaks()
         base = y + height - 1
         max_h = max(3, min(8, height // 4 if height > 20 else 4))
+        # tiny terminals: skip spectrum when it would collide with title/progress
+        if base - max_h <= ay + art_rows + 4:
+            return
         start_x = x + max(0, (width - len(vals) * 2) // 2)
         for i, v in enumerate(vals):
             h = max(1, int(v * max_h))

@@ -171,3 +171,26 @@ def test_wide_terminal_keeps_full_footer():
     footer_lines = [l for l in frame.split("\n") if "type to search" in l]
     assert footer_lines
     assert tui.FOOTER in footer_lines[0]
+
+
+def test_tiny_terminal_renders_at_true_size():
+    """A 40x15 terminal must render 40x15, not a clamped 60x20 garble."""
+    state = {
+        "version": 1,
+        "playing": True,
+        "paused": False,
+        "title": "Short",
+        "artist": "A",
+        "id": "x",
+        "thumb": None,
+        "duration": 100,
+        "position": 5,
+        "queue": [{"id": "2", "title": "Next", "artist": "B", "duration": 90, "thumb": None}],
+    }
+    renderer = tui.Renderer(out=io.StringIO())
+    frame = renderer.render_once(state=state, size=(40, 15))
+    lines = frame.split("\n")
+    assert len(lines) == 15
+    for i, line in enumerate(lines):
+        w = _independent_disp_width(line)
+        assert w <= 40, f"line {i} is {w} cells wide (max 40): {line!r}"
