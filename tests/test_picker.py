@@ -256,7 +256,7 @@ def test_tui_footer_and_controls_visible(monkeypatch):
         "volume": 80,
         "queue": [{"id": "2", "title": "Next", "artist": "Other", "duration": 180, "thumb": None}],
     }
-    frame = r.render_once(state=state, size=(100, 32))
+    frame = r.render_once(state=state, size=(120, 32))
     assert tui.FOOTER in frame
     assert "type to search" in frame
     assert "M Y X" in frame

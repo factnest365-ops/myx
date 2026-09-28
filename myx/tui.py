@@ -18,6 +18,7 @@ import sys
 import termios
 import time
 import tty
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import gettempdir
@@ -88,17 +89,85 @@ ALT_ON = "\x1b[?1049h"
 ALT_OFF = "\x1b[?1049l"
 
 
+# CSI (cursor/color), OSC (iterm2 image; BEL or ST terminated), APC/DCS (kitty image).
+ANSI_RE = re.compile(
+    r"\x1b\[[0-9;?]*[A-Za-z]"
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
+    r"|\x1b_[^\x1b]*\x1b\\"
+    r"|\x1b[PX^][^\x1b]*\x1b\\"
+)
+
+
 def strip_ansi(s: str) -> str:
-    return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", s)
+    return ANSI_RE.sub("", s)
+
+
+def _cell_width(ch: str) -> int:
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 
 
 def cell_len(s: str) -> int:
-    return len(strip_ansi(s))
+    """Visible width of `s` in terminal cells (CJK/emoji count 2)."""
+    return sum(_cell_width(ch) for ch in strip_ansi(s))
 
 
 def crop(s: str, width: int) -> str:
+    """Plain-text prefix fitting in `width` cells (never splits a wide char)."""
     plain = strip_ansi(s)
-    return plain[: max(0, width)]
+    out: list[str] = []
+    w = 0
+    for ch in plain:
+        cw = _cell_width(ch)
+        if w + cw > max(0, width):
+            break
+        out.append(ch)
+        w += cw
+    return "".join(out)
+
+
+def clip(s: str, width: int) -> str:
+    """Truncate to `width` cells, keeping every ANSI escape (incl. trailing RESET)."""
+    if width <= 0:
+        return ""
+    out: list[str] = []
+    w = 0
+    over = False
+
+    def take(chunk: str) -> None:
+        nonlocal w, over
+        for ch in chunk:
+            if over:
+                return
+            cw = _cell_width(ch)
+            if w + cw > width:
+                over = True
+                return
+            out.append(ch)
+            w += cw
+
+    pos = 0
+    for m in ANSI_RE.finditer(s):
+        take(s[pos : m.start()])
+        out.append(m.group(0))
+        pos = m.end()
+    take(s[pos:])
+    return "".join(out)
+
+
+def _plain_between(s: str, start_col: int, end_col: int | None = None) -> str:
+    """Plain text covering display columns [start_col, end_col) of `s`."""
+    out: list[str] = []
+    w = 0
+    for ch in s:
+        cw = _cell_width(ch)
+        if w >= start_col and (end_col is None or w < end_col):
+            out.append(ch)
+        w += cw
+        if end_col is not None and w >= end_col:
+            break
+    return "".join(out)
 
 
 def pad(s: str, width: int) -> str:
@@ -471,20 +540,15 @@ class Renderer:
         def put(y: int, x: int, text: str) -> None:
             if not (0 <= y < rows) or x >= cols:
                 return
+            x = max(0, x)
             vis = cell_len(text)
             allow = cols - x
             if vis > allow:
-                # footer/toast rows need full overflow so the keybind strip stays intact
-                if y >= rows - 2:
-                    raw = strip_ansi(canvas[y])
-                    pre = raw[:x]
-                    canvas[y] = bg("bg") + fg("fg") + pre + text + RESET
-                    return
-                text = strip_ansi(text)[: max(0, allow)]
+                text = clip(text, allow)
                 vis = cell_len(text)
             raw = strip_ansi(canvas[y])
-            pre = raw[:x]
-            post = raw[x + vis :] if x + vis < cols else ""
+            pre = _plain_between(raw, 0, x)
+            post = _plain_between(raw, x + vis) if x + vis < cols else ""
             canvas[y] = bg("bg") + fg("fg") + pre + text + post + RESET
 
         put(0, 1, fg("accent") + BOLD + "M Y X" + RESET)
@@ -619,9 +683,9 @@ class Renderer:
             put(ay + n, ax, line)
         title = str(state.get("title") or "Unknown")
         artist = str(state.get("artist") or "")
-        put(ay + art_rows + 1, x + max(0, (width - min(len(title), width - 2)) // 2), fg("fg") + BOLD + crop(title, width - 2) + RESET)
+        put(ay + art_rows + 1, x + max(0, (width - min(cell_len(title), width - 2)) // 2), fg("fg") + BOLD + crop(title, width - 2) + RESET)
         if artist:
-            put(ay + art_rows + 2, x + max(0, (width - min(len(artist), width - 2)) // 2), fg("dim") + crop(artist, width - 2) + RESET)
+            put(ay + art_rows + 2, x + max(0, (width - min(cell_len(artist), width - 2)) // 2), fg("dim") + crop(artist, width - 2) + RESET)
         pos = float(state.get("position") or 0)
         dur = float(state.get("duration") or 0)
         bar_w = max(10, width - 16)
@@ -648,7 +712,7 @@ class Renderer:
         start_y = y + max(0, (height - len(lines)) // 2)
         for n, (line, active) in enumerate(lines):
             color = fg("accent") + BOLD if active else fg("fg")
-            put(start_y + n, x + max(0, (width - len(line)) // 2), color + crop(line, width) + RESET)
+            put(start_y + n, x + max(0, (width - cell_len(line)) // 2), color + crop(line, width) + RESET)
 
     # -- picker overlays --
     def _overlay_box(self, put: Any, cols: int, rows: int, w: int, h: int) -> tuple[int, int]:
