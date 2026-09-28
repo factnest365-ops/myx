@@ -38,8 +38,9 @@ def _url(video_id: str) -> str:
 
 
 class PlayerDaemon:
-    def __init__(self, url: str):
+    def __init__(self, url: str, no_lyrics: bool = False):
         self.url = url
+        self.no_lyrics = no_lyrics or os.environ.get("MYX_NO_LYRICS") == "1"
         self.stop = threading.Event()
         self.lock = threading.RLock()
         self.mpv: subprocess.Popen[str] | None = None
@@ -425,6 +426,8 @@ class PlayerDaemon:
             return None
 
     def _resolve_lyrics(self, vid: str | None, title: Any, artist: Any, duration: Any) -> dict[str, str | None]:
+        if self.no_lyrics:
+            return {"lrc": None, "plain": None}
         if not vid:
             return {"lrc": None, "plain": None}
         if vid in self._lyrics_cache:
@@ -678,7 +681,12 @@ def main(argv: list[str] | None = None) -> int:
     if not argv:
         print("usage: python -m myx.player <url>", file=sys.stderr)
         return 2
-    daemon = PlayerDaemon(argv[0])
+    no_lyrics = "--no-lyrics" in argv
+    argv = [a for a in argv if a != "--no-lyrics"]
+    if not argv:
+        print("usage: python -m myx.player <url>", file=sys.stderr)
+        return 2
+    daemon = PlayerDaemon(argv[0], no_lyrics=no_lyrics)
     def _term(_signum: int, _frame: Any) -> None:
         daemon.stop.set()
     signal.signal(signal.SIGTERM, _term)

@@ -43,6 +43,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--search", help="Open search results into the queue")
     parser.add_argument("--lyrics-only", action="store_true", help="Developer aid: start in lyrics view")
     parser.add_argument("--state", action="store_true", help="Print current player state as JSON and exit (agent-friendly)")
+    parser.add_argument("--no-lyrics", action="store_true", help="Battery/memory saver: skip lyrics fetch (headless/agent mode)")
     sub = parser.add_subparsers(dest="subcommand")
     mcp_p = sub.add_parser("mcp", help="Run MYX as an MCP server over stdio (for agents)")
     mcp_p.add_argument("--stdio", action="store_true", help="Use stdio transport (default)")
@@ -272,13 +273,16 @@ def daemon_running() -> bool:
     return bool(pid and CMD_SOCK.exists())
 
 
-def boot_daemon(seed: str | None = None) -> subprocess.Popen[str] | None:
+def boot_daemon(seed: str | None = None, no_lyrics: bool = False) -> subprocess.Popen[str] | None:
     if daemon_running():
         return None
     args = [sys.executable, "-m", "myx.player"]
     if seed:
         args.append(seed)
-    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
+    if no_lyrics:
+        args.append("--no-lyrics")
+    env = {**os.environ, "MYX_NO_LYRICS": "1"} if no_lyrics else None
+    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, env=env)
     write_lock(proc.pid)
     return proc
 
@@ -326,7 +330,7 @@ def main(argv: list[str] | None = None) -> int:
     check_bins()
     # if daemon already running and a seed url was given, append it instead of ignoring
     already = daemon_running()
-    proc = boot_daemon(args.url)
+    proc = boot_daemon(args.url, no_lyrics=getattr(args, "no_lyrics", False))
     if proc:
         atexit.register(cleanup, proc)
         signal.signal(signal.SIGTERM, lambda *_: (cleanup(proc), raise_sigterm()))
