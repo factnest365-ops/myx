@@ -54,6 +54,7 @@ STATE_PATH = Path(os.environ.get("MYX_STATE", Path(gettempdir()) / "myx-state.js
 CMD_SOCK = Path(os.environ.get("MYX_CMD_SOCK", Path(gettempdir()) / "myx-cmd.sock"))
 FOOTER = "type to search · ? help · q quit · space pause · n next · p prev · s shuffle · +,- vol · l lyrics · enter play"
 CONTROLS_HINT = "[ ▶ Play ] [ ⏸ Pause ] [ ⏭ Next ] [ 🔀 Shuffle ]"
+AUTO_HINT = "♪  Search to add songs  ·  Updating player... run myx doctor if this persists"
 
 THEME = {
     "bg": "#0d0d0d",
@@ -645,11 +646,11 @@ class Renderer:
         else:
             self._draw_now(put, state, left_w + 1, 1, right_w, body_h - 1)
 
-        # resilience toast: idle state shows updating hint
-        if not self.toast and self._is_empty_state(state):
-            # only show if not already in search overlay (search is the action)
-            if self.overlay != "search":
-                self.toast = "♪  Search to add songs  ·  Updating player... run myx doctor if this persists"
+        # resilience toast: idle state shows updating hint; drop it once recovered
+        if self.toast == AUTO_HINT and (not self._is_empty_state(state) or self.overlay == "search"):
+            self.toast = ""
+        if not self.toast and self._is_empty_state(state) and self.overlay != "search":
+            self.toast = AUTO_HINT
 
         # bottom controls hint row (above footer) — accent buttons
         controls = fg("dim") + CONTROLS_HINT + RESET

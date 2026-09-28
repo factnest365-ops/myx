@@ -209,3 +209,19 @@ def test_art_cache_key_includes_cell_size(monkeypatch):
     assert first == ["HB-20x10"]
     assert again == first, "same size must hit the cache"
     assert resized == ["HB-30x15"], "size change must re-render, not serve stale cache"
+
+
+def test_auto_hint_toast_clears_after_recovery():
+    """The empty-state doctor hint must not stick once playback resumes."""
+    r = tui.Renderer(out=io.StringIO())
+    empty = {"playing": False, "title": "MYX", "queue": []}
+    r.render_once(state=empty, size=(100, 32))
+    assert r.toast == tui.AUTO_HINT
+    playing = {
+        "playing": True,
+        "title": "Song",
+        "queue": [{"id": "1", "title": "Song", "artist": "A", "duration": 90, "thumb": None}],
+    }
+    frame = r.render_once(state=playing, size=(100, 32))
+    assert r.toast == "", "stale auto hint must clear on recovery"
+    assert "Updating player" not in frame
