@@ -331,8 +331,7 @@ def daemon_running() -> bool:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(0.5)
             sock.connect(str(CMD_SOCK))
-            sock.sendall(b'{"cmd":"__probe__"}\n')
-            return bool(sock.recv(1024))
+            return True
     except OSError:
         return False
 

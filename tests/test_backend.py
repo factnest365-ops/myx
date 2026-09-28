@@ -278,6 +278,29 @@ def test_cli_state_keeps_old_state_for_live_daemon(monkeypatch, tmp_path, capsys
     assert json.loads(capsys.readouterr().out)["playing"] is True
 
 
+def test_cli_liveness_does_not_wait_for_command_reply(monkeypatch, tmp_path):
+    from myx import cli
+
+    class SlowCommandSocket:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return None
+        def settimeout(self, value):
+            return None
+        def connect(self, path):
+            return None
+        def recv(self, size):
+            raise AssertionError("liveness must not wait for a reply")
+
+    sock_path = tmp_path / "myx-cmd.sock"
+    sock_path.touch()
+    monkeypatch.setattr(cli, "read_lock", lambda: 123)
+    monkeypatch.setattr(cli, "CMD_SOCK", sock_path)
+    monkeypatch.setattr(cli.socket, "socket", lambda *args: SlowCommandSocket())
+    assert cli.daemon_running() is True
+
+
 def test_write_state_does_not_wait_for_lyrics(monkeypatch, tmp_path):
     import myx.player as player_mod
     import threading

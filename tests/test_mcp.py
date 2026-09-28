@@ -173,6 +173,27 @@ def test_mcp_state_rejects_non_object_json(tmp_path, monkeypatch):
     assert mcp._read_state() == {"playing": False, "paused": True, "title": None, "artist": None, "queue": []}
 
 
+def test_mcp_liveness_does_not_wait_for_command_reply(tmp_path, monkeypatch):
+    import myx.mcp as mcp
+
+    class SlowCommandSocket:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return None
+        def settimeout(self, value):
+            return None
+        def connect(self, path):
+            return None
+        def recv(self, size):
+            raise AssertionError("liveness must not wait for a reply")
+
+    sock_path = tmp_path / "myx-cmd.sock"
+    sock_path.touch()
+    monkeypatch.setattr(mcp.socket, "socket", lambda *args: SlowCommandSocket())
+    assert mcp._daemon_reachable(sock_path) is True
+
+
 def test_initialize_response_precedes_no_server_notification():
     lines = _run_stdio('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n')
     assert len(lines) == 1
