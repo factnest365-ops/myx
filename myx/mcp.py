@@ -63,7 +63,7 @@ def _candidate_cmd_socks() -> list[Path]:
 def _candidate_mpv_socks() -> list[Path]:
     seen: set[Path] = set()
     out: list[Path] = []
-    for p in [PLAYER_MPV_SOCK, CMD_SOCK, PLAYER_CMD_SOCK] + [d / "myx-mpv.sock" for d in _get_fallback_tmpdirs()]:
+    for p in [PLAYER_MPV_SOCK] + [d / "myx-mpv.sock" for d in _get_fallback_tmpdirs()]:
         if p not in seen:
             seen.add(p)
             out.append(p)
@@ -297,6 +297,26 @@ def _tool_error(msg: str) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": msg}], "isError": True}
 
 
+def _checked_delta(args: dict) -> int:
+    try:
+        delta = int(args["delta"])
+    except (TypeError, ValueError):
+        raise ValueError("delta must be a number (+-N)")
+    if not -100 <= delta <= 100:
+        raise ValueError("delta must be within +-100")
+    return delta
+
+
+def _checked_volume(args: dict) -> int:
+    try:
+        vol = int(args["volume"])
+    except (TypeError, ValueError):
+        raise ValueError("volume must be a number 0..100")
+    if not 0 <= vol <= 100:
+        raise ValueError("volume must be 0..100")
+    return vol
+
+
 def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     try:
         if name == "myx_play":
@@ -386,9 +406,9 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
         elif name == "myx_volume":
             if "delta" in args and args["delta"] is not None:
-                return _tool_result(_send_cmd("vol", value=int(args["delta"])))
+                return _tool_result(_send_cmd("vol", value=_checked_delta(args)))
             if "volume" in args and args["volume"] is not None:
-                return _tool_result(_send_cmd("vol", arg=int(args["volume"])))
+                return _tool_result(_send_cmd("vol", arg=_checked_volume(args)))
             return _tool_error("provide volume (0..100) or delta (±N)")
 
         elif name == "myx_shuffle":

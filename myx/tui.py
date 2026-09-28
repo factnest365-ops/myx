@@ -286,11 +286,18 @@ class ArtRenderer:
         except Exception:
             return self._placeholder(cells, rows)
         lines: list[str] = []
+        row_bytes = px_w * 4
+        if len(raw) < px_h * row_bytes:
+            return self._placeholder(cells, rows)
         for y in range(0, px_h, 2):
             parts = []
+            top_row = y * row_bytes
+            bot_row = (y + 1) * row_bytes
             for x in range(px_w):
-                top = (y * px_w + x) * 4
-                bot = ((y + 1) * px_w + x) * 4
+                top = top_row + x * 4
+                bot = bot_row + x * 4
+                if bot + 2 >= len(raw):
+                    break
                 tr, tg, tb = raw[top], raw[top + 1], raw[top + 2]
                 br, bgc, bb = raw[bot], raw[bot + 1], raw[bot + 2]
                 parts.append(f"\x1b[38;2;{tr};{tg};{tb}m\x1b[48;2;{br};{bgc};{bb}m▀")
@@ -333,10 +340,17 @@ class LyricsState:
 
 def parse_lrc(text: str) -> list[tuple[float, str]]:
     out: list[tuple[float, str]] = []
-    for line in text.splitlines():
-        match = re.match(r"\[(\d+):(\d+(?:\.\d+)?)\](.*)", line)
-        if match:
-            out.append((int(match.group(1)) * 60 + float(match.group(2)), match.group(3).strip()))
+    for line in (text or "").splitlines():
+        stamps = re.findall(r"\[(\d+):(\d+(?:\.\d+)?)\]", line)
+        if not stamps:
+            continue
+        lyric = re.sub(r"(?:\[\d+:\d+(?:\.\d+)?\])+", "", line).strip()
+        for minute, second in stamps:
+            try:
+                out.append((int(minute) * 60 + float(second), lyric))
+            except ValueError:
+                continue
+    out.sort(key=lambda item: item[0])
     return out
 
 

@@ -24,7 +24,7 @@ STATE_PATH = TMPDIR / "myx-state.json"
 def _video_id(value: str | None) -> str | None:
     if not value:
         return None
-    for pat in (r"[?&]v=([^&]+)", r"youtu\.be/([^?&/]+)", r"/watch/([^?&/]+)"):
+    for pat in (r"[?&]v=([^&]+)", r"youtu\.be/([^?&/]+)", r"/shorts/([^?&/]+)", r"/embed/([^?&/]+)", r"/live/([^?&/]+)", r"/watch/([^?&/]+)"):
         m = re.search(pat, value)
         if m:
             return m.group(1)
@@ -38,8 +38,9 @@ def _url(video_id: str) -> str:
 
 
 class PlayerDaemon:
-    def __init__(self, url: str):
+    def __init__(self, url: str, no_lyrics: bool = False):
         self.url = url
+        self.no_lyrics = no_lyrics or os.environ.get("MYX_NO_LYRICS") == "1"
         self.stop = threading.Event()
         self.lock = threading.RLock()
         self.mpv: subprocess.Popen[str] | None = None
@@ -51,6 +52,7 @@ class PlayerDaemon:
 
         self._queue_meta_cache: dict[str, dict[str, Any]] = {}
         self._stream_cache: dict[str, str] = {}
+        self._stream_cache_at: dict[str, float] = {}
         self._id_by_path: dict[str, str] = {}
         self._idle_since: float | None = None
 
@@ -225,9 +227,12 @@ class PlayerDaemon:
             self.seen.add(video_id)
         return True
 
+    STREAM_TTL_S = 4 * 3600  # YouTube CDN URLs expire (~6h); refresh early.
+
     def _stream_for(self, video_id: str) -> str:
         cached = self._stream_cache.get(video_id)
-        if cached:
+        cached_at = self._stream_cache_at.get(video_id, 0.0)
+        if cached and (time.monotonic() - cached_at) < self.STREAM_TTL_S:
             return cached
         try:
             url = sources.stream_url(video_id)
@@ -235,6 +240,7 @@ class PlayerDaemon:
             print(f"[myx] stream resolve failed ({exc}); delegating to mpv", file=sys.stderr)
             return _url(video_id)
         self._stream_cache[video_id] = url
+        self._stream_cache_at[video_id] = time.monotonic()
         return url
 
     def _play_now(self, video_id: str) -> None:
@@ -262,7 +268,18 @@ class PlayerDaemon:
             if self._append_track(vid, True):
                 added += 1
         if added == 0 and chain:
+            # Fresh seed resets the seen-set so a new radio doesn't starve;
+            # fallback replays avoid re-adding tracks already in mpv.
+            try:
+                playlist_ids = {
+                    self._id_by_path.get(item.get("filename") or "") or _video_id(item.get("filename"))
+                    for item in self._playlist()
+                }
+            except Exception:
+                playlist_ids = set()
             for vid in chain:
+                if vid in playlist_ids:
+                    continue
                 self._append_track(vid, False)
                 added += 1
         return added > 0
@@ -425,6 +442,8 @@ class PlayerDaemon:
             return None
 
     def _resolve_lyrics(self, vid: str | None, title: Any, artist: Any, duration: Any) -> dict[str, str | None]:
+        if self.no_lyrics:
+            return {"lrc": None, "plain": None}
         if not vid:
             return {"lrc": None, "plain": None}
         if vid in self._lyrics_cache:
@@ -551,8 +570,12 @@ class PlayerDaemon:
             elif cmd == "shuffle":
                 self._mpv(["playlist-shuffle"])
             elif cmd == "play_id":
-                vid = str(arg)
+                vid = _video_id(str(arg)) if arg is not None else None
+                if not vid:
+                    return {"ok": False, "error": "play_id requires a YouTube URL or video id"}
                 self._play_now(vid)
+                # New seed = new radio: drop the old seen-set so refill doesn't starve.
+                self.seen = {vid}
                 self.cached_chain.clear()
                 try:
                     playlist = self._playlist()
@@ -566,6 +589,8 @@ class PlayerDaemon:
                 except Exception:
                     pass
             elif cmd == "load":
+                if arg is None or not str(arg).strip():
+                    return {"ok": False, "error": "load requires a URL or video id"}
                 self._mpv(["loadfile", str(arg), "append"])
                 vid = _video_id(str(arg))
                 if vid:
@@ -678,7 +703,12 @@ def main(argv: list[str] | None = None) -> int:
     if not argv:
         print("usage: python -m myx.player <url>", file=sys.stderr)
         return 2
-    daemon = PlayerDaemon(argv[0])
+    no_lyrics = "--no-lyrics" in argv
+    argv = [a for a in argv if a != "--no-lyrics"]
+    if not argv:
+        print("usage: python -m myx.player <url>", file=sys.stderr)
+        return 2
+    daemon = PlayerDaemon(argv[0], no_lyrics=no_lyrics)
     def _term(_signum: int, _frame: Any) -> None:
         daemon.stop.set()
     signal.signal(signal.SIGTERM, _term)

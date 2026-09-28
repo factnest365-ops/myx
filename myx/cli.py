@@ -33,10 +33,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--search", help="Open search results into the queue")
     parser.add_argument("--lyrics-only", action="store_true", help="Developer aid: start in lyrics view")
     parser.add_argument("--state", action="store_true", help="Print current player state as JSON and exit (agent-friendly)")
+    parser.add_argument("--no-lyrics", action="store_true", help="Battery/memory saver: skip lyrics fetch (headless/agent mode)")
+    parser.add_argument("extra_search", nargs="*", help="Search words when no URL flag is given (e.g. myx lofi hip hop)")
     sub = parser.add_subparsers(dest="subcommand")
     mcp_p = sub.add_parser("mcp", help="Run MYX as an MCP server over stdio (for agents)")
     mcp_p.add_argument("--stdio", action="store_true", help="Use stdio transport (default)")
     return parser.parse_args(argv)
+
+
+def split_search_words(argv: list[str] | None) -> tuple[list[str] | None, str | None]:
+    """Split bare search words from argv before argparse sees them.
+
+    Needed because argparse routes a second positional to the `mcp`
+    subcommand choice. `myx lofi hip hop` -> (rest, "lofi hip hop").
+    A real URL/id in position 1 stays a seed, never a search.
+    """
+    if not argv:
+        return argv, None
+    if argv[0].startswith("-") or argv[0] == "mcp":
+        return argv, None
+    if len(argv) == 1:
+        return argv, None
+    first = argv[0]
+    looks_like_seed = (
+        "://" in first
+        or first.startswith("www.")
+        or (len(first) >= 6 and all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-" for c in first))
+    )
+    if looks_like_seed:
+        return argv, None
+    return [argv[0]], " ".join(argv)
 
 
 def check_bins() -> None:
@@ -71,13 +97,16 @@ def daemon_running() -> bool:
     return bool(pid and CMD_SOCK.exists())
 
 
-def boot_daemon(seed: str | None = None) -> subprocess.Popen[str] | None:
+def boot_daemon(seed: str | None = None, no_lyrics: bool = False) -> subprocess.Popen[str] | None:
     if daemon_running():
         return None
     args = [sys.executable, "-m", "myx.player"]
     if seed:
         args.append(seed)
-    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
+    if no_lyrics:
+        args.append("--no-lyrics")
+    env = {**os.environ, "MYX_NO_LYRICS": "1"} if no_lyrics else None
+    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, env=env)
     write_lock(proc.pid)
     return proc
 
@@ -103,7 +132,25 @@ def queue_search(query: str) -> None:
     tui.send_command("search", arg=query)
 
 
+def pick_interactive(message: str = "Search music") -> str | None:
+    """Minimal guided picker: works with or without a TTY.
+
+    Returns the chosen query/URL or None if the user aborts.
+    """
+    prompt = f"{message} (type a search or paste a link, empty aborts): "
+    try:
+        if not sys.stdin.isatty():
+            line = sys.stdin.readline()
+        else:
+            line = input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        return None
+    line = (line or "").strip()
+    return line or None
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv, bare_search = split_search_words(list(argv) if argv is not None else None)
     args = parse_args(argv)
     # Agent-native entrypoints — no bin checks, no TUI needed
     if getattr(args, "subcommand", None) == "mcp":
@@ -120,9 +167,24 @@ def main(argv: list[str] | None = None) -> int:
             print(_json.dumps({"playing": False, "paused": True, "queue": []}))
         return 0
     check_bins()
+    if bare_search and not args.url and not args.search:
+        args.search = bare_search
+    elif getattr(args, "extra_search", None) and not args.url and not args.search:
+        args.search = " ".join(args.extra_search)
+    # No-args guided entry: pick a search/link instead of idling on "Waiting".
+    if not args.url and not args.search and not args.lyrics_only:
+        choice = pick_interactive()
+        if not choice:
+            print("MYX — pass a link, or: myx --search \"lofi\" | myx mcp --stdio | myx --state")
+            return 0
+        looks_like_url = "://" in choice or choice.startswith("www.") or len(choice) >= 6 and all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-" for c in choice)
+        if looks_like_url:
+            args.url = choice
+        else:
+            args.search = choice
     # if daemon already running and a seed url was given, append it instead of ignoring
     already = daemon_running()
-    proc = boot_daemon(args.url)
+    proc = boot_daemon(args.url, no_lyrics=getattr(args, "no_lyrics", False))
     if proc:
         atexit.register(cleanup, proc)
         signal.signal(signal.SIGTERM, lambda *_: (cleanup(proc), raise_sigterm()))
@@ -141,6 +203,9 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             print(f"search failed: {exc}", file=sys.stderr)
     if args.lyrics_only:
+        # Lyrics-only aid must not kill a daemon we just booted.
+        if proc:
+            atexit.unregister(cleanup)
         renderer = tui.Renderer()
         renderer.view = "lyrics"
         renderer.render_once()
