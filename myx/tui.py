@@ -503,6 +503,7 @@ class Renderer:
     _pending_delete_idx: int | None = None
     _delete_confirm_time: float = 0.0
     _last_search_fire: float = 0.0
+    _search_note: str = ""
 
     def _is_empty_state(self, state: dict[str, Any]) -> bool:
         queue = state.get("queue") or []
@@ -525,6 +526,7 @@ class Renderer:
         if cur - self._last_search_fire < 0.25:
             return
         self._last_search_fire = cur
+        self._search_note = ""
         q = self.picker.query.strip()
         self.picker.set_loading(True)
         try:
@@ -552,6 +554,7 @@ class Renderer:
                     queued = resp.get("queued")
                     if queued is not None:
                         self.toast = f"queued {queued}"
+                        self._search_note = f"queued {queued} — added to queue"
                     self.picker.set_results([])
         except Exception as exc:
             self.picker.set_error(str(exc))
@@ -562,6 +565,7 @@ class Renderer:
         self.overlay = "search"
         self.picker.set_query(initial, now=time.monotonic())
         self._last_search_fire = 0.0
+        self._search_note = ""
         self.toast = ""
 
     def open_command_palette(self) -> None:
@@ -838,6 +842,8 @@ class Renderer:
             status = fg("dim") + "Searching..." + RESET
         elif self.picker.error:
             status = fg("err") + crop(self.picker.error, inner_w) + RESET
+        elif self._search_note:
+            status = fg("accent") + crop(self._search_note, inner_w) + RESET
         elif self.picker.query and not self.picker.results:
             status = fg("dim") + f"No results for '{crop(self.picker.query, 20)}' — try another search" + RESET
         elif self.picker.results:
@@ -961,10 +967,12 @@ class Renderer:
         if key in ("\x7f", "\x08", "\b"):
             self.picker.backspace(now=time.monotonic())
             self._last_search_fire = 0.0
+            self._search_note = ""
             return True
         if key == "\x15":  # ctrl-u clear
             self.picker.set_query("", now=time.monotonic())
             self._last_search_fire = 0.0
+            self._search_note = ""
             return True
         if key in ("\x1b[A", "k"):
             self.picker.move(-1)
@@ -984,7 +992,11 @@ class Renderer:
             else:
                 # no selection but query present — trigger search via daemon queue
                 q = self.picker.query.strip()
-                if q:
+                if q and self._search_note:
+                    # this query already went through; Enter must not double-queue
+                    self.toast = self._search_note
+                    self.close_overlay()
+                elif q:
                     try:
                         fn = self.search_fn or (lambda qq: send_command("search", arg=qq))
                         resp = fn(q)
@@ -1000,6 +1012,7 @@ class Renderer:
         if len(key) == 1 and key.isprintable():
             self.picker.append_char(key, now=time.monotonic())
             self._last_search_fire = 0.0
+            self._search_note = ""
             # lazy attempt will fire on next render tick via _maybe_fire_search from run loop;
             # also show loading hint
             return True

@@ -225,3 +225,46 @@ def test_auto_hint_toast_clears_after_recovery():
     frame = r.render_once(state=playing, size=(100, 32))
     assert r.toast == "", "stale auto hint must clear on recovery"
     assert "Updating player" not in frame
+
+
+def test_daemon_search_shows_queued_note_not_no_results(monkeypatch):
+    monkeypatch.setattr(tui, "send_command", lambda cmd, **kw: {"ok": True, "queued": 3})
+    r = tui.Renderer(out=io.StringIO())
+    r.open_search()
+    r.picker.set_query("hello", now=100.0)
+    r._maybe_fire_search(now=101.0)
+    assert r._search_note == "queued 3 — added to queue"
+    assert r.picker.results == []
+    frame = r.render_once(state={"playing": False, "title": "MYX", "queue": []}, size=(100, 32))
+    assert "added to queue" in frame
+    assert "No results" not in frame
+
+
+def test_enter_does_not_double_queue_after_daemon_search(monkeypatch):
+    calls: list = []
+
+    def fake_send(cmd, **kw):
+        calls.append(cmd)
+        return {"ok": True, "queued": 3}
+
+    monkeypatch.setattr(tui, "send_command", fake_send)
+    r = tui.Renderer(out=io.StringIO())
+    r.open_search()
+    r.picker.set_query("hello", now=100.0)
+    r._maybe_fire_search(now=101.0)
+    assert len(calls) == 1
+    r.handle_key("\r")
+    assert len(calls) == 1, "Enter re-fired search and double-queued"
+    assert r.overlay is None
+    assert r.toast == "queued 3 — added to queue"
+
+
+def test_search_note_clears_when_query_changes(monkeypatch):
+    monkeypatch.setattr(tui, "send_command", lambda cmd, **kw: {"ok": True, "queued": 3})
+    r = tui.Renderer(out=io.StringIO())
+    r.open_search()
+    r.picker.set_query("hello", now=100.0)
+    r._maybe_fire_search(now=101.0)
+    assert r._search_note
+    r.handle_key("z")
+    assert r._search_note == ""
