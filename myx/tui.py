@@ -18,10 +18,12 @@ import sys
 import termios
 import time
 import tty
+import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import gettempdir
-from typing import IO, Any, Callable
+from typing import IO, Any
 
 try:  # numpy is allowed for the spectrum tap.
     import numpy as np
@@ -30,29 +32,28 @@ except Exception:  # pragma: no cover - exercised only without project deps
 
 try:
     from .picker import (  # type: ignore
-        COMMAND_PALETTE,
         KEYBINDS,
         TOUR_STEPS,
         PickerState,
         command_palette_search,
         format_duration,
-        fuzzy_filter,
     )
 except Exception:  # fallback for hermetic env without package install
     from myx.picker import (  # type: ignore
-        COMMAND_PALETTE,
         KEYBINDS,
         TOUR_STEPS,
         PickerState,
         command_palette_search,
         format_duration,
-        fuzzy_filter,
     )
 
 STATE_PATH = Path(os.environ.get("MYX_STATE", Path(gettempdir()) / "myx-state.json"))
 CMD_SOCK = Path(os.environ.get("MYX_CMD_SOCK", Path(gettempdir()) / "myx-cmd.sock"))
 FOOTER = "type to search · ? help · q quit · space pause · n next · p prev · s shuffle · +,- vol · l lyrics · enter play"
 CONTROLS_HINT = "[ ▶ Play ] [ ⏸ Pause ] [ ⏭ Next ] [ 🔀 Shuffle ]"
+AUTO_HINT = (
+    "♪  Search to add songs  ·  Updating player... run myx doctor if this persists"
+)
 
 THEME = {
     "bg": "#0d0d0d",
@@ -88,17 +89,85 @@ ALT_ON = "\x1b[?1049h"
 ALT_OFF = "\x1b[?1049l"
 
 
+# CSI (cursor/color), OSC (iterm2 image; BEL or ST terminated), APC/DCS (kitty image).
+ANSI_RE = re.compile(
+    r"\x1b\[[0-9;?]*[A-Za-z]"
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
+    r"|\x1b_[^\x1b]*\x1b\\"
+    r"|\x1b[PX^][^\x1b]*\x1b\\"
+)
+
+
 def strip_ansi(s: str) -> str:
-    return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", s)
+    return ANSI_RE.sub("", s)
+
+
+def _cell_width(ch: str) -> int:
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 
 
 def cell_len(s: str) -> int:
-    return len(strip_ansi(s))
+    """Visible width of `s` in terminal cells (CJK/emoji count 2)."""
+    return sum(_cell_width(ch) for ch in strip_ansi(s))
 
 
 def crop(s: str, width: int) -> str:
+    """Plain-text prefix fitting in `width` cells (never splits a wide char)."""
     plain = strip_ansi(s)
-    return plain[: max(0, width)]
+    out: list[str] = []
+    w = 0
+    for ch in plain:
+        cw = _cell_width(ch)
+        if w + cw > max(0, width):
+            break
+        out.append(ch)
+        w += cw
+    return "".join(out)
+
+
+def clip(s: str, width: int) -> str:
+    """Truncate to `width` cells, keeping every ANSI escape (incl. trailing RESET)."""
+    if width <= 0:
+        return ""
+    out: list[str] = []
+    w = 0
+    over = False
+
+    def take(chunk: str) -> None:
+        nonlocal w, over
+        for ch in chunk:
+            if over:
+                return
+            cw = _cell_width(ch)
+            if w + cw > width:
+                over = True
+                return
+            out.append(ch)
+            w += cw
+
+    pos = 0
+    for m in ANSI_RE.finditer(s):
+        take(s[pos : m.start()])
+        out.append(m.group(0))
+        pos = m.end()
+    take(s[pos:])
+    return "".join(out)
+
+
+def _plain_between(s: str, start_col: int, end_col: int | None = None) -> str:
+    """Plain text covering display columns [start_col, end_col) of `s`."""
+    out: list[str] = []
+    w = 0
+    for ch in s:
+        cw = _cell_width(ch)
+        if w >= start_col and (end_col is None or w < end_col):
+            out.append(ch)
+        w += cw
+        if end_col is not None and w >= end_col:
+            break
+    return "".join(out)
 
 
 def pad(s: str, width: int) -> str:
@@ -122,7 +191,7 @@ def load_theme() -> None:
         if "=" not in line:
             continue
         key, value = [p.strip() for p in line.split("=", 1)]
-        value = value.strip('"\'')
+        value = value.strip("\"'")
         if key in THEME and re.fullmatch(r"#[0-9a-fA-F]{6}", value):
             THEME[key] = value
 
@@ -131,9 +200,23 @@ def read_state(path: Path = STATE_PATH) -> dict[str, Any]:
     try:
         return json.loads(path.read_text())
     except FileNotFoundError:
-        return {"version": 1, "playing": False, "paused": True, "title": "MYX", "artist": "Waiting for player", "queue": []}
+        return {
+            "version": 1,
+            "playing": False,
+            "paused": True,
+            "title": "MYX",
+            "artist": "Waiting for player",
+            "queue": [],
+        }
     except Exception:
-        return {"version": 1, "playing": False, "paused": True, "title": "State unavailable", "artist": "", "queue": []}
+        return {
+            "version": 1,
+            "playing": False,
+            "paused": True,
+            "title": "State unavailable",
+            "artist": "",
+            "queue": [],
+        }
 
 
 def send_command(cmd: str, **payload: Any) -> dict[str, Any]:
@@ -177,20 +260,51 @@ class SpectrumSource:
 @dataclass
 class CavaSource(SpectrumSource):
     proc: subprocess.Popen[bytes] | None = None
+    _buf: bytes = b""
+    _last_vals: list[float] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         if shutil.which("cava"):
-            self.proc = subprocess.Popen(["cava", "-p", "/dev/stdin"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            self.proc = subprocess.Popen(
+                ["cava", "-p", "/dev/stdin"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
             if self.proc.stdin:
-                self.proc.stdin.write(b"[output]\nmethod = raw\nraw_target = /dev/stdout\ndata_format = ascii\nascii_max_range = 100\n")
+                self.proc.stdin.write(
+                    b"[output]\nmethod = raw\nraw_target = /dev/stdout\ndata_format = ascii\nascii_max_range = 100\n"
+                )
                 self.proc.stdin.close()
+        if self.proc and self.proc.stdout:
+            try:
+                os.set_blocking(self.proc.stdout.fileno(), False)
+            except (OSError, ValueError, AttributeError):
+                pass
 
     def values(self) -> list[float]:
         if not self.proc or not self.proc.stdout:
             return super().values()
-        line = self.proc.stdout.readline().decode(errors="ignore").strip()
+        try:
+            chunk = os.read(self.proc.stdout.fileno(), 65536)
+        except BlockingIOError:
+            return list(self._last_vals) if self._last_vals else super().values()
+        except OSError:
+            return super().values()
+        if not chunk:
+            return super().values()  # EOF: cava exited
+        self._buf += chunk
+        if b"\n" not in self._buf:
+            return list(self._last_vals) if self._last_vals else super().values()
+        *lines, self._buf = self._buf.split(b"\n")
+        line = lines[-1].decode(errors="ignore")
         nums = [int(x) / 100 for x in re.findall(r"\d+", line)]
-        return (nums[: self.bars] + [0.04] * self.bars)[: self.bars]
+        if not nums:
+            return list(self._last_vals) if self._last_vals else super().values()
+        vals = (nums[: self.bars] + [0.04] * self.bars)[: self.bars]
+        self._last_vals = vals
+        return vals
 
     def close(self) -> None:
         if self.proc:
@@ -201,21 +315,58 @@ class CavaSource(SpectrumSource):
 class FfmpegTapSource(SpectrumSource):
     stream_url: str | None = None
     proc: subprocess.Popen[bytes] | None = None
+    _buf: bytes = b""
+    _last_vals: list[float] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         if self.stream_url and shutil.which("ffmpeg") and np is not None:
             self.proc = subprocess.Popen(
-                ["ffmpeg", "-loglevel", "quiet", "-re", "-i", self.stream_url, "-f", "s16le", "-ac", "1", "-ar", "8000", "-"],
+                [
+                    "ffmpeg",
+                    "-loglevel",
+                    "quiet",
+                    "-re",
+                    "-i",
+                    self.stream_url,
+                    "-f",
+                    "s16le",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "8000",
+                    "-",
+                ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             )
+        if self.proc and self.proc.stdout:
+            try:
+                os.set_blocking(self.proc.stdout.fileno(), False)
+            except (OSError, ValueError, AttributeError):
+                pass
 
     def values(self) -> list[float]:
         if not self.proc or not self.proc.stdout or np is None:
             return super().values()
-        raw = self.proc.stdout.read(2048)
-        if len(raw) < 512:
+        try:
+            chunk = os.read(self.proc.stdout.fileno(), 65536)
+        except BlockingIOError:
+            chunk = b""
+        except OSError:
             return super().values()
+        if chunk:
+            self._buf += chunk
+            if len(self._buf) > 32768:
+                self._buf = self._buf[-32768:]
+        if len(self._buf) < 1024:
+            return list(self._last_vals) if self._last_vals else super().values()
+        n = min(len(self._buf), 8192)
+        n -= n % 2
+        raw = self._buf[-n:]
+        self._buf = b""
+        if len(raw) < 512:
+            return list(self._last_vals) if self._last_vals else super().values()
         samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
         fft = np.abs(np.fft.rfft(samples))[:64]
         if float(fft.max(initial=0)) <= 0:
@@ -223,7 +374,9 @@ class FfmpegTapSource(SpectrumSource):
         bins = np.array_split(np.log1p(fft), self.bars)
         vals = [float(b.mean()) for b in bins]
         m = max(vals) or 1.0
-        return [min(1.0, v / m) for v in vals]
+        vals = [min(1.0, v / m) for v in vals]
+        self._last_vals = vals
+        return vals
 
     def close(self) -> None:
         if self.proc:
@@ -259,7 +412,7 @@ def make_spectrum(stream_url: str | None = None) -> SpectrumSource:
 
 @dataclass
 class ArtRenderer:
-    last_path: str | None = None
+    last_key: tuple[str, int, int] | None = None
     last_lines: list[str] = field(default_factory=list)
     protocol: str = "none"
 
@@ -277,7 +430,8 @@ class ArtRenderer:
     def render(self, path: str | None, cells: int, rows: int) -> list[str]:
         if not path:
             return self._placeholder(cells, min(rows, cells // 2))
-        if path == self.last_path and self.last_lines:
+        key = (path, cells, rows)
+        if key == self.last_key and self.last_lines:
             return self.last_lines
         self.protocol = self.detect_protocol()
         if self.protocol == "kitty":
@@ -286,23 +440,40 @@ class ArtRenderer:
             self.last_lines = self._iterm2(path, cells, rows)
         else:
             self.last_lines = self._half_block(path, cells, rows)
-        self.last_path = path
+        self.last_key = key
         return self.last_lines
 
     def _kitty(self, path: str, cells: int, rows: int) -> list[str]:
         data = base64.b64encode(Path(path).read_bytes()).decode()
-        return [f"\x1b_Gf=100,a=T,s={cells},v={rows};{data}\x1b\\"] + [""] * max(0, rows - 1)
+        return [f"\x1b_Gf=100,a=T,s={cells},v={rows};{data}\x1b\\"] + [""] * max(
+            0, rows - 1
+        )
 
     def _iterm2(self, path: str, cells: int, rows: int) -> list[str]:
         data = base64.b64encode(Path(path).read_bytes()).decode()
-        return [f"\x1b]1337;File=inline=1;width={cells};height={rows};preserveAspectRatio=1:{data}\a"] + [""] * max(0, rows - 1)
+        return [
+            f"\x1b]1337;File=inline=1;width={cells};height={rows};preserveAspectRatio=1:{data}\a"
+        ] + [""] * max(0, rows - 1)
 
     def _half_block(self, path: str, cells: int, rows: int) -> list[str]:
         px_w = max(2, cells)
         px_h = max(2, rows * 2)
         try:
             raw = subprocess.check_output(
-                ["ffmpeg", "-loglevel", "quiet", "-i", path, "-vf", f"scale={px_w}:{px_h}", "-f", "rawvideo", "-pix_fmt", "rgba", "-"],
+                [
+                    "ffmpeg",
+                    "-loglevel",
+                    "quiet",
+                    "-i",
+                    path,
+                    "-vf",
+                    f"scale={px_w}:{px_h}",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba",
+                    "-",
+                ],
                 timeout=4,
             )
         except Exception:
@@ -320,7 +491,14 @@ class ArtRenderer:
         return lines
 
     def _placeholder(self, cells: int, rows: int) -> list[str]:
-        return [fg("dim") + "┌" + "─" * max(0, cells - 2) + "┐" + RESET] + [fg("dim") + "│" + " " * max(0, cells - 2) + "│" + RESET for _ in range(max(0, rows - 2))] + [fg("dim") + "└" + "─" * max(0, cells - 2) + "┘" + RESET]
+        return (
+            [fg("dim") + "┌" + "─" * max(0, cells - 2) + "┐" + RESET]
+            + [
+                fg("dim") + "│" + " " * max(0, cells - 2) + "│" + RESET
+                for _ in range(max(0, rows - 2))
+            ]
+            + [fg("dim") + "└" + "─" * max(0, cells - 2) + "┘" + RESET]
+        )
 
 
 @dataclass
@@ -347,7 +525,10 @@ class LyricsState:
                 if ts <= t:
                     idx = i
             start = max(0, idx - height // 2)
-            return [(line, start + n == idx) for n, (_, line) in enumerate(self.lrc[start : start + height])]
+            return [
+                (line, start + n == idx)
+                for n, (_, line) in enumerate(self.lrc[start : start + height])
+            ]
         lines = self.plain or ["No lyrics found"]
         start = max(0, (len(lines) - height) // 2)
         return [(line, False) for line in lines[start : start + height]]
@@ -358,7 +539,12 @@ def parse_lrc(text: str) -> list[tuple[float, str]]:
     for line in text.splitlines():
         match = re.match(r"\[(\d+):(\d+(?:\.\d+)?)\](.*)", line)
         if match:
-            out.append((int(match.group(1)) * 60 + float(match.group(2)), match.group(3).strip()))
+            out.append(
+                (
+                    int(match.group(1)) * 60 + float(match.group(2)),
+                    match.group(3).strip(),
+                )
+            )
     return out
 
 
@@ -372,6 +558,8 @@ class Renderer:
     selected: int = 0
     toast: str = ""
     spectrum: SpectrumSource = field(default_factory=SpectrumSource)
+    spectrum_auto: bool = False
+    _spectrum_key: Any = None
     # --- app-like picker state ---
     overlay: str | None = None  # None | "search" | "command" | "help"
     picker: PickerState = field(default_factory=PickerState)
@@ -381,6 +569,7 @@ class Renderer:
     _pending_delete_idx: int | None = None
     _delete_confirm_time: float = 0.0
     _last_search_fire: float = 0.0
+    _search_note: str = ""
 
     def _is_empty_state(self, state: dict[str, Any]) -> bool:
         queue = state.get("queue") or []
@@ -403,6 +592,7 @@ class Renderer:
         if cur - self._last_search_fire < 0.25:
             return
         self._last_search_fire = cur
+        self._search_note = ""
         q = self.picker.query.strip()
         self.picker.set_loading(True)
         try:
@@ -430,6 +620,7 @@ class Renderer:
                     queued = resp.get("queued")
                     if queued is not None:
                         self.toast = f"queued {queued}"
+                        self._search_note = f"queued {queued} — added to queue"
                     self.picker.set_results([])
         except Exception as exc:
             self.picker.set_error(str(exc))
@@ -440,6 +631,7 @@ class Renderer:
         self.overlay = "search"
         self.picker.set_query(initial, now=time.monotonic())
         self._last_search_fire = 0.0
+        self._search_note = ""
         self.toast = ""
 
     def open_command_palette(self) -> None:
@@ -457,12 +649,34 @@ class Renderer:
         self.command_query = ""
         self.command_selected = 0
 
-    def render_once(self, state: dict[str, Any] | None = None, size: tuple[int, int] | None = None) -> str:
+    def ensure_spectrum(self, state: dict[str, Any]) -> None:
+        """Lazily bind the best available spectrum source (once per stream url)."""
+        if not self.spectrum_auto:
+            return
+        url = str(state.get("url") or "") or None
+        if isinstance(self.spectrum, CavaSource):
+            key: Any = ("cava",)
+        else:
+            key = ("tap", url)
+        if key == self._spectrum_key:
+            return
+        if self._spectrum_key is not None:
+            try:
+                self.spectrum.close()
+            except Exception:  # noqa: BLE001 - plugin cleanup must not kill the TUI
+                pass
+        self.spectrum = make_spectrum(url)
+        self._spectrum_key = (
+            ("cava",) if isinstance(self.spectrum, CavaSource) else ("tap", url)
+        )
+
+    def render_once(
+        self, state: dict[str, Any] | None = None, size: tuple[int, int] | None = None
+    ) -> str:
         state = state or read_state(self.state_path)
         self.lyrics.load_from_state(state)
+        self.ensure_spectrum(state)
         cols, rows = size or shutil.get_terminal_size((100, 32))
-        cols = max(60, cols)
-        rows = max(20, rows)
         left_w = max(24, int(cols * 0.38))
         right_w = cols - left_w - 1
         body_h = rows - 3
@@ -471,23 +685,17 @@ class Renderer:
         def put(y: int, x: int, text: str) -> None:
             if not (0 <= y < rows) or x >= cols:
                 return
+            x = max(0, x)
             vis = cell_len(text)
             allow = cols - x
             if vis > allow:
-                # footer/toast rows need full overflow so the keybind strip stays intact
-                if y >= rows - 2:
-                    raw = strip_ansi(canvas[y])
-                    pre = raw[:x]
-                    canvas[y] = bg("bg") + fg("fg") + pre + text + RESET
-                    return
-                text = strip_ansi(text)[: max(0, allow)]
+                text = clip(text, allow)
                 vis = cell_len(text)
             raw = strip_ansi(canvas[y])
-            pre = raw[:x]
-            post = raw[x + vis :] if x + vis < cols else ""
+            pre = _plain_between(raw, 0, x)
+            post = _plain_between(raw, x + vis) if x + vis < cols else ""
             canvas[y] = bg("bg") + fg("fg") + pre + text + post + RESET
 
-        put(0, 1, fg("accent") + BOLD + "M Y X" + RESET)
         tabs = [("now", "Now Playing"), ("lyrics", "Lyrics"), ("queue", "Queue")]
         tab_parts: list[str] = []
         for idx, (key, label) in enumerate(tabs):
@@ -495,11 +703,18 @@ class Renderer:
             if key == "queue" and self.view == "queue":
                 active = True
             sep = " · " if idx else ""
-            tab_parts.append(sep + (fg("accent") + "•• " + label if active else fg("dim") + label) + RESET)
+            tab_parts.append(
+                sep
+                + (fg("accent") + "•• " + label if active else fg("dim") + label)
+                + RESET
+            )
             if idx == 0 and active:
                 pass
         tabs_str = "".join(tab_parts)
-        put(0, cols - cell_len(strip_ansi(tabs_str)) - 2, tabs_str)
+        # one put for the whole header: a second put would strip the first one's styles
+        tabs_x = max(8, cols - cell_len(strip_ansi(tabs_str)) - 2)
+        gap = max(1, tabs_x - 6)
+        put(0, 0, " " + fg("accent") + BOLD + "M Y X" + RESET + " " * gap + tabs_str)
         # vertical divider
         for yy in range(1, rows - 1):
             put(yy, left_w, fg("dim") + "│" + RESET)
@@ -511,21 +726,24 @@ class Renderer:
         else:
             self._draw_now(put, state, left_w + 1, 1, right_w, body_h - 1)
 
-        # resilience toast: idle state shows updating hint
-        if not self.toast and self._is_empty_state(state):
-            # only show if not already in search overlay (search is the action)
-            if self.overlay != "search":
-                self.toast = "♪  Search to add songs  ·  Updating player... run myx doctor if this persists"
+        # resilience toast: idle state shows updating hint; drop it once recovered
+        if self.toast == AUTO_HINT and (
+            not self._is_empty_state(state) or self.overlay == "search"
+        ):
+            self.toast = ""
+        if not self.toast and self._is_empty_state(state) and self.overlay != "search":
+            self.toast = AUTO_HINT
 
-        # bottom controls hint row (above footer) — accent buttons
-        controls = fg("dim") + CONTROLS_HINT + RESET
-        put(rows - 2, max(0, cols - cell_len(strip_ansi(controls)) - 2), controls)
+        if self.toast:
+            # toast wins row rows-2: controls hint would collide on narrow terminals
+            put(rows - 2, 2, fg("accent") + crop(self.toast, max(0, cols - 4)) + RESET)
+        else:
+            controls = fg("dim") + CONTROLS_HINT + RESET
+            put(rows - 2, max(0, cols - cell_len(strip_ansi(controls)) - 2), controls)
 
         footer = fg("dim") + FOOTER + RESET
         # spec: always full footer visible — write at 0, not centered-clip
         put(rows - 1, 0, footer)
-        if self.toast:
-            put(rows - 2, 2, fg("accent") + self.toast + RESET)
 
         # overlays on top
         if self.overlay == "search":
@@ -540,15 +758,27 @@ class Renderer:
         self.out.flush()
         return frame
 
-    def _draw_queue(self, canvas: list[str], put: Any, state: dict[str, Any], width: int, height: int) -> None:
+    def _draw_queue(
+        self,
+        canvas: list[str],
+        put: Any,
+        state: dict[str, Any],
+        width: int,
+        height: int,
+    ) -> None:
         queue = state.get("queue") or []
-        current = {"title": state.get("title"), "artist": state.get("artist"), "duration": state.get("duration"), "thumb": state.get("thumb")}
+        current = {
+            "title": state.get("title"),
+            "artist": state.get("artist"),
+            "duration": state.get("duration"),
+            "thumb": state.get("thumb"),
+        }
         items = [current] + list(queue)
         total = len(items)
         pos = 1
         total_sec = int(sum(float(i.get("duration") or 0) for i in items))
         self.selected = max(0, min(self.selected, max(0, total - 1)))
-        put(1, 2, fg("dim") + f"< Library  {pos}/{max(total,1)} · {total_sec}" + RESET)
+        put(1, 2, fg("dim") + f"< Library  {pos}/{max(total, 1)} · {total_sec}" + RESET)
         header = "▸ Play Liked Songs"
         put(2, 2, bg("accent") + fg("bg") + " " + pad(header, width - 4) + " " + RESET)
         y = 3
@@ -557,9 +787,17 @@ class Renderer:
         if not queue and self._is_empty_state(state):
             # show centered illustration hint inside left panel below header
             hint = "♪  Search above to add songs"
-            put(y + avail // 2, 2 + max(0, (width - len(hint)) // 2), fg("dim") + hint + RESET)
+            put(
+                y + avail // 2,
+                2 + max(0, (width - len(hint)) // 2),
+                fg("dim") + hint + RESET,
+            )
             box_hint = fg("dim") + "type to search — results appear instantly" + RESET
-            put(y + avail // 2 + 1, 2 + max(0, (width - cell_len(strip_ansi(box_hint))) // 2), box_hint)
+            put(
+                y + avail // 2 + 1,
+                2 + max(0, (width - cell_len(strip_ansi(box_hint))) // 2),
+                box_hint,
+            )
         for i, item in enumerate(items[:avail]):
             # skip drawing placeholder "MYX/Unknown" when empty state — hint already shown
             if self._is_empty_state(state) and i == 0 and not queue:
@@ -588,70 +826,135 @@ class Renderer:
             put(y, 2, " " + line)
             y += 1
 
-    def _draw_queue_full(self, put: Any, state: dict[str, Any], x: int, y: int, width: int, height: int) -> None:
+    def _draw_queue_full(
+        self, put: Any, state: dict[str, Any], x: int, y: int, width: int, height: int
+    ) -> None:
         queue = state.get("queue") or []
-        current = {"title": state.get("title"), "artist": state.get("artist"), "duration": state.get("duration"), "thumb": state.get("thumb"), "id": state.get("id")}
+        current = {
+            "title": state.get("title"),
+            "artist": state.get("artist"),
+            "duration": state.get("duration"),
+            "thumb": state.get("thumb"),
+            "id": state.get("id"),
+        }
         items = [current] + list(queue)
         self.selected = max(0, min(self.selected, max(0, len(items) - 1)))
         put(y, x, fg("accent") + BOLD + f"Queue — {len(items)} tracks" + RESET)
         if not queue and self._is_empty_state(state):
             hint = "♪  Search above to add songs"
-            put(y + height // 2, x + max(0, (width - len(hint)) // 2), fg("dim") + hint + RESET)
+            put(
+                y + height // 2,
+                x + max(0, (width - len(hint)) // 2),
+                fg("dim") + hint + RESET,
+            )
             return
-        for idx, item in enumerate(items[:height - 2]):
+        for idx, item in enumerate(items[: height - 2]):
             title = str(item.get("title") or "Unknown")
             artist = str(item.get("artist") or "")
             dur = mmss(item.get("duration"))
-            line = f"{idx+1:>2}. {crop(title, max(10, width - 22))}"
+            line = f"{idx + 1:>2}. {crop(title, max(10, width - 22))}"
             if artist:
                 line = pad(line, width - 8) + fg("dim") + crop(artist, 10) + RESET
-            color = bg("accent") + fg("bg") if idx == self.selected else (fg("accent") if idx == 0 else fg("fg"))
-            put(y + 1 + idx, x, color + pad(crop(line, width), width) + fg("dim") + f" {dur}" + RESET)
+            color = (
+                bg("accent") + fg("bg")
+                if idx == self.selected
+                else (fg("accent") if idx == 0 else fg("fg"))
+            )
+            put(
+                y + 1 + idx,
+                x,
+                color + pad(crop(line, width), width) + fg("dim") + f" {dur}" + RESET,
+            )
 
-    def _draw_now(self, put: Any, state: dict[str, Any], x: int, y: int, width: int, height: int) -> None:
+    def _draw_now(
+        self, put: Any, state: dict[str, Any], x: int, y: int, width: int, height: int
+    ) -> None:
         reserved = 12
         art_h = max(6, height - reserved)
         art_cells = min(40, max(12, min(width - 4, art_h * 2)))
         art_rows = max(6, min(art_cells // 2, art_h))
         ax = x + max(0, (width - art_cells) // 2)
         ay = y
-        for n, line in enumerate(self.art.render(state.get("thumb"), art_cells, art_rows)):
+        for n, line in enumerate(
+            self.art.render(state.get("thumb"), art_cells, art_rows)
+        ):
             put(ay + n, ax, line)
         title = str(state.get("title") or "Unknown")
         artist = str(state.get("artist") or "")
-        put(ay + art_rows + 1, x + max(0, (width - min(len(title), width - 2)) // 2), fg("fg") + BOLD + crop(title, width - 2) + RESET)
+        put(
+            ay + art_rows + 1,
+            x + max(0, (width - min(cell_len(title), width - 2)) // 2),
+            fg("fg") + BOLD + crop(title, width - 2) + RESET,
+        )
         if artist:
-            put(ay + art_rows + 2, x + max(0, (width - min(len(artist), width - 2)) // 2), fg("dim") + crop(artist, width - 2) + RESET)
+            put(
+                ay + art_rows + 2,
+                x + max(0, (width - min(cell_len(artist), width - 2)) // 2),
+                fg("dim") + crop(artist, width - 2) + RESET,
+            )
         pos = float(state.get("position") or 0)
         dur = float(state.get("duration") or 0)
         bar_w = max(10, width - 16)
         fill = int((pos / dur) * bar_w) if dur else 0
         bar = "─" * max(0, fill) + "o" + "─" * max(0, bar_w - fill - 1)
-        put(ay + art_rows + 4, x + max(0, (width - (bar_w + 10)) // 2), fg("dim") + f"{mmss(pos)} " + fg("accent") + bar + fg("dim") + f" {mmss(dur)}" + RESET)
+        put(
+            ay + art_rows + 4,
+            x + max(0, (width - (bar_w + 10)) // 2),
+            fg("dim")
+            + f"{mmss(pos)} "
+            + fg("accent")
+            + bar
+            + fg("dim")
+            + f" {mmss(dur)}"
+            + RESET,
+        )
         vals, peaks = self.spectrum.values_with_peaks()
         base = y + height - 1
-        max_h = max(3, min(8, height // 4 if height > 20 else 4))
+        # spectrum lives strictly below the progress bar row
+        avail = base - (ay + art_rows + 4) - 1
+        if avail < 3:
+            return
+        max_h = max(3, min(8, avail, height // 4 if height > 20 else 4))
         start_x = x + max(0, (width - len(vals) * 2) // 2)
-        for i, v in enumerate(vals):
-            h = max(1, int(v * max_h))
-            peak_h = max(1, int(peaks[i] * max_h)) if i < len(peaks) else h
-            for j in range(h):
-                frac = (j + 1) / max_h * 0.55 + (i / max(1, len(vals))) * 0.45
-                put(base - j, start_x + i * 2, _bar_color(frac) + "█" + RESET)
-            if peak_h > h:
-                put(base - peak_h, start_x + i * 2, fg("accent") + "·" + RESET)
-            elif peak_h == h and h < max_h:
-                put(base - peak_h, start_x + i * 2, fg("accent") + "▀" + RESET)
+        n = len(vals)
+        # one put per row: many puts on the same row would strip each other's styles
+        for row_off in range(max_h + 1):
+            r = base - row_off
+            if r < y:
+                break
+            parts: list[str] = []
+            for i in range(n):
+                h = max(1, int(vals[i] * max_h))
+                peak_h = max(1, int(peaks[i] * max_h)) if i < len(peaks) else h
+                if row_off < h:
+                    frac = (row_off + 1) / max_h * 0.55 + (i / max(1, n)) * 0.45
+                    parts.append(_bar_color(frac) + "█")
+                elif row_off == peak_h and peak_h > h:
+                    parts.append(fg("accent") + "·")
+                elif row_off == h and peak_h == h and h < max_h:
+                    parts.append(fg("accent") + "▀")
+                else:
+                    parts.append(" ")
+                parts.append(" ")
+            put(r, start_x, "".join(parts) + RESET)
 
-    def _draw_lyrics(self, put: Any, state: dict[str, Any], x: int, y: int, width: int, height: int) -> None:
+    def _draw_lyrics(
+        self, put: Any, state: dict[str, Any], x: int, y: int, width: int, height: int
+    ) -> None:
         lines = self.lyrics.visible(float(state.get("position") or 0), height)
         start_y = y + max(0, (height - len(lines)) // 2)
         for n, (line, active) in enumerate(lines):
             color = fg("accent") + BOLD if active else fg("fg")
-            put(start_y + n, x + max(0, (width - len(line)) // 2), color + crop(line, width) + RESET)
+            put(
+                start_y + n,
+                x + max(0, (width - cell_len(line)) // 2),
+                color + crop(line, width) + RESET,
+            )
 
     # -- picker overlays --
-    def _overlay_box(self, put: Any, cols: int, rows: int, w: int, h: int) -> tuple[int, int]:
+    def _overlay_box(
+        self, put: Any, cols: int, rows: int, w: int, h: int
+    ) -> tuple[int, int]:
         """Compute centered box origin; caller draws border/content."""
         w = min(w, cols - 4)
         h = min(h, rows - 4)
@@ -673,7 +976,17 @@ class Renderer:
         x, y = self._overlay_box(put, cols, rows, w, h)
         inner_w = w - 4
         # title
-        put(y + 1, x + 2, fg("accent") + BOLD + "Search" + RESET + fg("dim") + "  ·  type to filter, enter to play, esc to close" + RESET)
+        put(
+            y + 1,
+            x + 2,
+            fg("accent")
+            + BOLD
+            + "Search"
+            + RESET
+            + fg("dim")
+            + "  ·  type to filter, enter to play, esc to close"
+            + RESET,
+        )
         # input field
         query_disp = self.picker.query if self.picker.query else ""
         placeholder = "Search for songs, artists..." if not query_disp else ""
@@ -681,19 +994,47 @@ class Renderer:
         field_text = f"Search › {query_disp}{cursor}"
         if placeholder and not query_disp:
             field_text = f"Search › {fg('dim')}{placeholder}{RESET}"
-        put(y + 2, x + 2, bg("accent") + fg("bg") + " " + pad(crop(strip_ansi(field_text) if placeholder else field_text, inner_w - 2), inner_w - 2) + " " + RESET)
+        put(
+            y + 2,
+            x + 2,
+            bg("accent")
+            + fg("bg")
+            + " "
+            + pad(
+                crop(
+                    strip_ansi(field_text) if placeholder else field_text, inner_w - 2
+                ),
+                inner_w - 2,
+            )
+            + " "
+            + RESET,
+        )
         # status line
         status = ""
         if self.picker.loading:
             status = fg("dim") + "Searching..." + RESET
         elif self.picker.error:
             status = fg("err") + crop(self.picker.error, inner_w) + RESET
+        elif self._search_note:
+            status = fg("accent") + crop(self._search_note, inner_w) + RESET
         elif self.picker.query and not self.picker.results:
-            status = fg("dim") + f"No results for '{crop(self.picker.query, 20)}' — try another search" + RESET
+            status = (
+                fg("dim")
+                + f"No results for '{crop(self.picker.query, 20)}' — try another search"
+                + RESET
+            )
         elif self.picker.results:
-            status = fg("dim") + f"{len(self.picker.results)} results  ·  ↑↓ navigate  ·  enter play" + RESET
+            status = (
+                fg("dim")
+                + f"{len(self.picker.results)} results  ·  ↑↓ navigate  ·  enter play"
+                + RESET
+            )
         else:
-            status = fg("dim") + "Type to search YouTube / YT Music — results appear instantly" + RESET
+            status = (
+                fg("dim")
+                + "Type to search YouTube / YT Music — results appear instantly"
+                + RESET
+            )
         put(y + 3, x + 2, status)
         # results list
         avail = h - 6
@@ -725,7 +1066,16 @@ class Renderer:
             line = pad(base, allow) + " " + fg("dim") + dur + RESET
             is_sel = ri == self.picker.selected
             if is_sel:
-                put(y + 4 + idx, x + 2, bg("accent") + fg("bg") + " " + pad(crop(strip_ansi(line), inner_w - 2), inner_w - 2) + " " + RESET)
+                put(
+                    y + 4 + idx,
+                    x + 2,
+                    bg("accent")
+                    + fg("bg")
+                    + " "
+                    + pad(crop(strip_ansi(line), inner_w - 2), inner_w - 2)
+                    + " "
+                    + RESET,
+                )
             else:
                 put(y + 4 + idx, x + 2, " " + line)
 
@@ -736,14 +1086,38 @@ class Renderer:
         h = max(8, min(h, rows - 4))
         x, y = self._overlay_box(put, cols, rows, w, h)
         inner_w = w - 4
-        put(y + 1, x + 2, fg("accent") + BOLD + "Command Palette" + RESET + fg("dim") + "  ·  ctrl-k / ?  ·  esc to close" + RESET)
+        put(
+            y + 1,
+            x + 2,
+            fg("accent")
+            + BOLD
+            + "Command Palette"
+            + RESET
+            + fg("dim")
+            + "  ·  ctrl-k / ?  ·  esc to close"
+            + RESET,
+        )
         qdisp = self.command_query or ""
         placeholder = "Type a command..." if not qdisp else ""
         field = f"› {qdisp}▌" if qdisp else f"› {fg('dim')}{placeholder}{RESET}"
-        put(y + 2, x + 2, bg("accent") + fg("bg") + " " + pad(crop(strip_ansi(field) if not qdisp else field, inner_w - 2), inner_w - 2) + " " + RESET)
+        put(
+            y + 2,
+            x + 2,
+            bg("accent")
+            + fg("bg")
+            + " "
+            + pad(
+                crop(strip_ansi(field) if not qdisp else field, inner_w - 2),
+                inner_w - 2,
+            )
+            + " "
+            + RESET,
+        )
         avail = h - 5
         # clamp selection
-        self.command_selected = max(0, min(self.command_selected, max(0, len(filtered) - 1)))
+        self.command_selected = max(
+            0, min(self.command_selected, max(0, len(filtered) - 1))
+        )
         start = max(0, self.command_selected - avail // 2)
         for idx in range(avail):
             fi = start + idx
@@ -756,7 +1130,16 @@ class Renderer:
             line = pad(line, inner_w - 12) + fg("dim") + crop(keys, 10) + RESET
             is_sel = fi == self.command_selected
             if is_sel:
-                put(y + 3 + idx, x + 2, bg("accent") + fg("bg") + " " + pad(crop(strip_ansi(line), inner_w - 2), inner_w - 2) + " " + RESET)
+                put(
+                    y + 3 + idx,
+                    x + 2,
+                    bg("accent")
+                    + fg("bg")
+                    + " "
+                    + pad(crop(strip_ansi(line), inner_w - 2), inner_w - 2)
+                    + " "
+                    + RESET,
+                )
             else:
                 put(y + 3 + idx, x + 2, " " + line)
 
@@ -765,7 +1148,17 @@ class Renderer:
         h = min(22, rows - 4)
         x, y = self._overlay_box(put, cols, rows, w, h)
         inner_w = w - 4
-        put(y + 1, x + 2, fg("accent") + BOLD + "Help  ·  MYX Tour" + RESET + fg("dim") + "  ·  ? / esc to close" + RESET)
+        put(
+            y + 1,
+            x + 2,
+            fg("accent")
+            + BOLD
+            + "Help  ·  MYX Tour"
+            + RESET
+            + fg("dim")
+            + "  ·  ? / esc to close"
+            + RESET,
+        )
         # tour steps
         line_y = y + 2
         for step in TOUR_STEPS:
@@ -796,7 +1189,15 @@ class Renderer:
         for kb in KEYBINDS[: max(0, y + h - 1 - line_y)]:
             keys = kb.get("keys", "")
             desc = kb.get("desc", "")
-            put(line_y, x + 2, fg("fg") + pad(crop(keys, 18), 18) + fg("dim") + crop(desc, inner_w - 20) + RESET)
+            put(
+                line_y,
+                x + 2,
+                fg("fg")
+                + pad(crop(keys, 18), 18)
+                + fg("dim")
+                + crop(desc, inner_w - 20)
+                + RESET,
+            )
             line_y += 1
 
     # -- key handling --
@@ -811,10 +1212,12 @@ class Renderer:
         if key in ("\x7f", "\x08", "\b"):
             self.picker.backspace(now=time.monotonic())
             self._last_search_fire = 0.0
+            self._search_note = ""
             return True
         if key == "\x15":  # ctrl-u clear
             self.picker.set_query("", now=time.monotonic())
             self._last_search_fire = 0.0
+            self._search_note = ""
             return True
         if key in ("\x1b[A", "k"):
             self.picker.move(-1)
@@ -834,15 +1237,27 @@ class Renderer:
             else:
                 # no selection but query present — trigger search via daemon queue
                 q = self.picker.query.strip()
-                if q:
+                if q and self._search_note:
+                    # this query already went through; Enter must not double-queue
+                    self.toast = self._search_note
+                    self.close_overlay()
+                elif q:
                     try:
-                        fn = self.search_fn or (lambda qq: send_command("search", arg=qq))
+                        fn = self.search_fn or (
+                            lambda qq: send_command("search", arg=qq)
+                        )
                         resp = fn(q)
                         if isinstance(resp, dict) and resp.get("ok") is False:
                             self.toast = str(resp.get("error") or "search failed")
                         else:
-                            queued = resp.get("queued") if isinstance(resp, dict) else None
-                            self.toast = f"queued {queued}" if queued is not None else f"queued: {q}"
+                            queued = (
+                                resp.get("queued") if isinstance(resp, dict) else None
+                            )
+                            self.toast = (
+                                f"queued {queued}"
+                                if queued is not None
+                                else f"queued: {q}"
+                            )
                             self.close_overlay()
                     except Exception as exc:
                         self.toast = str(exc)
@@ -850,6 +1265,7 @@ class Renderer:
         if len(key) == 1 and key.isprintable():
             self.picker.append_char(key, now=time.monotonic())
             self._last_search_fire = 0.0
+            self._search_note = ""
             # lazy attempt will fire on next render tick via _maybe_fire_search from run loop;
             # also show loading hint
             return True
@@ -884,7 +1300,9 @@ class Renderer:
             return True
         if key in ("\x1b[B", "j"):
             filtered = command_palette_search(self.command_query)
-            self.command_selected = min(max(0, len(filtered) - 1), self.command_selected + 1)
+            self.command_selected = min(
+                max(0, len(filtered) - 1), self.command_selected + 1
+            )
             return True
         if key in ("\r", "\n"):
             filtered = command_palette_search(self.command_query)
@@ -973,7 +1391,21 @@ class Renderer:
             # they have explicit UX and tests expect them to work. Only non-command
             # printable chars auto-open search. In empty state this still gives
             # "type to search" front-door for letters/digits/symbols.
-            known_cmds = {"q", "n", "p", "s", "l", "d", "+", "-", "=", "[", "]", "j", "k"}
+            known_cmds = {
+                "q",
+                "n",
+                "p",
+                "s",
+                "l",
+                "d",
+                "+",
+                "-",
+                "=",
+                "[",
+                "]",
+                "j",
+                "k",
+            }
             if key in known_cmds:
                 pass
             else:
@@ -1022,7 +1454,10 @@ class Renderer:
                     # double-press to confirm within 2s
                     now = time.monotonic()
                     idx = self.selected - 1
-                    if self._pending_delete_idx == idx and (now - self._delete_confirm_time) < 2.0:
+                    if (
+                        self._pending_delete_idx == idx
+                        and (now - self._delete_confirm_time) < 2.0
+                    ):
                         send_command("del", arg=idx)
                         self.selected = max(0, self.selected - 1)
                         self._pending_delete_idx = None
@@ -1046,6 +1481,7 @@ class Renderer:
 def run(state_path: Path = STATE_PATH, out: IO[str] = sys.stdout) -> int:
     load_theme()
     renderer = Renderer(state_path=state_path, out=out)
+    renderer.spectrum_auto = True
     old = None
     interactive = out.isatty() and sys.stdin.isatty()
     if interactive:

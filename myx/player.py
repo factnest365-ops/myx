@@ -38,8 +38,9 @@ def _url(video_id: str) -> str:
 
 
 class PlayerDaemon:
-    def __init__(self, url: str):
+    def __init__(self, url: str | None = None, no_lyrics: bool = False):
         self.url = url
+        self.no_lyrics = no_lyrics or os.environ.get("MYX_NO_LYRICS") == "1"
         self.stop = threading.Event()
         self.lock = threading.RLock()
         self.mpv: subprocess.Popen[str] | None = None
@@ -47,11 +48,14 @@ class PlayerDaemon:
         self.seen: set[str] = set()
         self.cached_chain: dict[str, list[str]] = {}
         self._lyrics_cache: dict[str, dict[str, str | None]] = {}
+        self._lyrics_inflight: set[str] = set()
+        self._lyrics_lock = threading.Lock()
         self._thumb_cache: dict[str, str | None] = {}
 
         self._queue_meta_cache: dict[str, dict[str, Any]] = {}
         self._stream_cache: dict[str, str] = {}
         self._id_by_path: dict[str, str] = {}
+        self._current_meta: dict[str, Any] = {}
         self._idle_since: float | None = None
 
     def _candidate_cmd_socks(self) -> list[Path]:
@@ -66,7 +70,7 @@ class PlayerDaemon:
                 out.append(p)
         return out
 
-    def _acquire_singleton(self, url: str) -> bool:
+    def _acquire_singleton(self, url: str | None) -> bool:
         lock_path = TMPDIR / "myx.lock"
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -80,13 +84,16 @@ class PlayerDaemon:
         except Exception:
             return True
 
-        vid = _video_id(url) or url
+        vid = _video_id(url) if url else None
+        # With no seed there is nothing to hand off — probe liveness with a
+        # harmless unknown command instead of sending play_id(None).
+        req = {"cmd": "play_id", "arg": vid} if vid else {"cmd": "__probe__"}
         for sock_path in self._candidate_cmd_socks():
             try:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
                     s.settimeout(0.6)
                     s.connect(str(sock_path))
-                    s.sendall((json.dumps({"cmd": "play_id", "arg": vid}) + "\n").encode())
+                    s.sendall((json.dumps(req) + "\n").encode())
                     s.recv(1024)
                 print(f"delegated to existing daemon at {sock_path}", file=sys.stderr)
                 return False
@@ -113,25 +120,53 @@ class PlayerDaemon:
             return
         self._cleanup_sockets()
         try:
-            subprocess.run(["pkill", "-f", "myx-mpv.sock"], capture_output=True, timeout=2)
+            subprocess.run(
+                ["pkill", "-f", "myx-mpv.sock"], capture_output=True, timeout=2
+            )
         except Exception:
             pass
         self._spawn_mpv()
         self._wait_for_socket(MPV_SOCK)
-        seed_vid = _video_id(self.url)
-        if seed_vid:
-            self._play_now(seed_vid)
-        else:
-            self._mpv(["loadfile", self.url, "replace"])
-        threads = [
-            threading.Thread(target=self._command_server, daemon=True),
-            threading.Thread(target=self._refill_loop, daemon=True),
-            threading.Thread(target=self._state_loop, daemon=True),
-            threading.Thread(target=self._queue_hydration_loop, daemon=True),
-            threading.Thread(target=self._healthcheck_loop, daemon=True),
-        ]
-        for t in threads:
-            t.start()
+        # Start command server and refill loop first — they must be responsive
+        # for CLI/TUI/MCP. Seed resolution (with metadata fetch) happens next
+        # so the first state write has correct title/artist.
+        self._command_server_thread = threading.Thread(
+            target=self._command_server, daemon=True
+        )
+        self._refill_loop_thread = threading.Thread(
+            target=self._refill_loop, daemon=True
+        )
+        self._command_server_thread.start()
+        self._refill_loop_thread.start()
+        try:
+            if self.url:
+                seed_vid = _video_id(self.url)
+                if seed_vid:
+                    self._play_now(seed_vid)
+                else:
+                    # Fallback: load URL directly and try to extract metadata from it
+                    self._mpv(["loadfile", self.url, "replace"])
+                    # Best effort: try to extract video ID from URL for metadata
+                    fallback_vid = _video_id(self.url)
+                    if fallback_vid:
+                        try:
+                            self._current_meta = sources.meta(fallback_vid)
+                        except sources.SourcesError:
+                            self._current_meta = {}
+        finally:
+            # Now start remaining service threads
+            self._state_loop_thread = threading.Thread(
+                target=self._state_loop, daemon=True
+            )
+            self._queue_hydration_loop_thread = threading.Thread(
+                target=self._queue_hydration_loop, daemon=True
+            )
+            self._healthcheck_loop_thread = threading.Thread(
+                target=self._healthcheck_loop, daemon=True
+            )
+            self._state_loop_thread.start()
+            self._queue_hydration_loop_thread.start()
+            self._healthcheck_loop_thread.start()
         try:
             while not self.stop.is_set():
                 if self.mpv and self.mpv.poll() is not None:
@@ -153,20 +188,28 @@ class PlayerDaemon:
             except subprocess.TimeoutExpired:
                 self.mpv.kill()
         self._cleanup_sockets()
+        # Remove state file so dead daemon cannot report stale playing state
+        try:
+            STATE_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
         try:
             (TMPDIR / "myx.lock").unlink()
         except Exception:
             pass
 
     def _spawn_mpv(self) -> None:
-        self.mpv = subprocess.Popen([
-            "mpv",
-            f"--input-ipc-server={MPV_SOCK}",
-            "--idle=yes",
-            "--no-video",
-            "--no-ytdl",
-            "--no-terminal",
-        ], text=True)
+        self.mpv = subprocess.Popen(
+            [
+                "mpv",
+                f"--input-ipc-server={MPV_SOCK}",
+                "--idle=yes",
+                "--no-video",
+                "--no-ytdl",
+                "--no-terminal",
+            ],
+            text=True,
+        )
 
     @staticmethod
     def _cleanup_sockets() -> None:
@@ -212,14 +255,20 @@ class PlayerDaemon:
     def _current_id(self) -> str | None:
         path = self._mpv(["get_property", "path"])
         return (
-            self._id_by_path.get(path or "")
-            or _video_id(path)
-            or _video_id(self.url)
+            self._id_by_path.get(path or "") or _video_id(path) or _video_id(self.url)
         )
 
     def _append_track(self, video_id: str, mark_seen: bool = True) -> bool:
         stream = self._stream_for(video_id)
-        self._mpv(["loadfile", stream, "append"])
+        # Cold start (idle daemon, empty playlist): plain "append" would queue
+        # the track without ever starting playback — mpv only starts on
+        # append-play when nothing is playing. While something plays this is
+        # identical to append (verified against the mpv manual).
+        try:
+            idle = not self._playlist()
+        except Exception:  # noqa: BLE001 - an IPC failure must not stop shutdown
+            idle = False
+        self._mpv(["loadfile", stream, "append-play" if idle else "append"])
         self._id_by_path[stream] = video_id
         if mark_seen:
             self.seen.add(video_id)
@@ -232,7 +281,10 @@ class PlayerDaemon:
         try:
             url = sources.stream_url(video_id)
         except sources.SourcesError as exc:
-            print(f"[myx] stream resolve failed ({exc}); delegating to mpv", file=sys.stderr)
+            print(
+                f"[myx] stream resolve failed ({exc}); delegating to mpv",
+                file=sys.stderr,
+            )
             return _url(video_id)
         self._stream_cache[video_id] = url
         return url
@@ -242,6 +294,11 @@ class PlayerDaemon:
         self._mpv(["loadfile", stream, "replace"])
         self._id_by_path[stream] = video_id
         self.seen.add(video_id)
+        # Resolve and cache metadata for current track so state shows correct title/artist
+        try:
+            self._current_meta = sources.meta(video_id)
+        except sources.SourcesError:
+            self._current_meta = {}
 
     def _append_related(self) -> bool:
         cur = self._current_id()
@@ -303,7 +360,9 @@ class PlayerDaemon:
                 pos = int(self._mpv(["get_property", "playlist-pos"]) or 0)
                 for idx in range(pos + 1, len(playlist)):
                     item = playlist[idx]
-                    item_id = self._id_by_path.get(item.get("filename") or "") or _video_id(item.get("filename"))
+                    item_id = self._id_by_path.get(
+                        item.get("filename") or ""
+                    ) or _video_id(item.get("filename"))
                     if not item_id:
                         continue
                     if item_id in self._queue_meta_cache:
@@ -311,9 +370,13 @@ class PlayerDaemon:
                     if item.get("title"):
                         self._queue_meta_cache[item_id] = {
                             "title": item.get("title"),
-                            "artist": item.get("uploader") if isinstance(item.get("uploader"), str) else None,
+                            "artist": item.get("uploader")
+                            if isinstance(item.get("uploader"), str)
+                            else None,
                             "duration": item.get("duration"),
-                            "thumb": item.get("thumbnail") if isinstance(item.get("thumbnail"), str) else None,
+                            "thumb": item.get("thumbnail")
+                            if isinstance(item.get("thumbnail"), str)
+                            else None,
                         }
                         continue
                     try:
@@ -346,7 +409,8 @@ class PlayerDaemon:
             elif current_path:
                 self._mpv(["loadfile", current_path, "replace"])
         except Exception:
-            self._mpv(["loadfile", self.url, "replace"])
+            if self.url:
+                self._mpv(["loadfile", self.url, "replace"])
         self.cached_chain.clear()
         try:
             self._append_related()
@@ -359,7 +423,10 @@ class PlayerDaemon:
             if self.stop.is_set():
                 break
             if self.mpv and self.mpv.poll() is not None:
-                print(f"[myx] mpv died (exit {self.mpv.poll()}), restarting", file=sys.stderr)
+                print(
+                    f"[myx] mpv died (exit {self.mpv.poll()}), restarting",
+                    file=sys.stderr,
+                )
                 try:
                     self._restart_mpv()
                 except Exception as exc2:
@@ -375,7 +442,10 @@ class PlayerDaemon:
                     fails += 1
                     time.sleep(0.4)
             if fails >= 2:
-                print("[myx] mpv healthcheck: socket unresponsive, restarting", file=sys.stderr)
+                print(
+                    "[myx] mpv healthcheck: socket unresponsive, restarting",
+                    file=sys.stderr,
+                )
                 try:
                     self._restart_mpv()
                 except Exception as exc2:
@@ -395,7 +465,10 @@ class PlayerDaemon:
                             self._idle_since = now
                         elif now - self._idle_since > 25:
                             self._idle_since = None
-                            print("[myx] eof watchdog: kicking stalled track (sustained idle)", file=sys.stderr)
+                            print(
+                                "[myx] eof watchdog: kicking stalled track (sustained idle)",
+                                file=sys.stderr,
+                            )
                             self._mpv(["playlist-next", "force"])
                     else:
                         self._idle_since = None
@@ -424,11 +497,28 @@ class PlayerDaemon:
             self._thumb_cache[cache_key] = None
             return None
 
-    def _resolve_lyrics(self, vid: str | None, title: Any, artist: Any, duration: Any) -> dict[str, str | None]:
+    def _resolve_lyrics(
+        self, vid: str | None, title: Any, artist: Any, duration: Any
+    ) -> dict[str, str | None]:
+        if self.no_lyrics:
+            return {"lrc": None, "plain": None}
         if not vid:
             return {"lrc": None, "plain": None}
         if vid in self._lyrics_cache:
             return self._lyrics_cache[vid]
+        with self._lyrics_lock:
+            if vid in self._lyrics_cache:
+                return self._lyrics_cache[vid]
+            if vid not in self._lyrics_inflight:
+                self._lyrics_inflight.add(vid)
+                threading.Thread(
+                    target=self._fetch_lyrics,
+                    args=(vid, title, artist, duration),
+                    daemon=True,
+                ).start()
+        return {"lrc": None, "plain": None}
+
+    def _fetch_lyrics(self, vid: str, title: Any, artist: Any, duration: Any) -> None:
         try:
             dur = None
             if duration is not None:
@@ -437,13 +527,11 @@ class PlayerDaemon:
                 except Exception:
                     dur = None
             data = sources.lyrics(str(title or ""), str(artist or ""), dur)
-            self._lyrics_cache[vid] = data
-            return data
-        except sources.SourcesError:
-            self._lyrics_cache[vid] = {"lrc": None, "plain": None}
-            return self._lyrics_cache[vid]
         except Exception:
-            return {"lrc": None, "plain": None}
+            data = {"lrc": None, "plain": None}
+        with self._lyrics_lock:
+            self._lyrics_cache[vid] = data
+            self._lyrics_inflight.discard(vid)
 
     def write_state(self) -> dict[str, Any]:
         playlist = self._playlist()
@@ -451,31 +539,61 @@ class PlayerDaemon:
         current = playlist[pos] if 0 <= pos < len(playlist) else {}
         path = current.get("filename") or self._mpv(["get_property", "path"])
         vid = self._id_by_path.get(path or "") or _video_id(path)
-        raw_thumb = current.get("thumbnail") if isinstance(current.get("thumbnail"), str) else None
+        raw_thumb = (
+            current.get("thumbnail")
+            if isinstance(current.get("thumbnail"), str)
+            else None
+        )
         cached_thumb = self._resolve_thumb(vid, raw_thumb)
         queue = []
         for item in playlist[pos + 1 :]:
-            item_id = self._id_by_path.get(item.get("filename") or "") or _video_id(item.get("filename"))
+            item_id = self._id_by_path.get(item.get("filename") or "") or _video_id(
+                item.get("filename")
+            )
             item_title = item.get("title")
             item_duration = item.get("duration")
-            item_raw_thumb = item.get("thumbnail") if isinstance(item.get("thumbnail"), str) else None
+            item_raw_thumb = (
+                item.get("thumbnail")
+                if isinstance(item.get("thumbnail"), str)
+                else None
+            )
             cached_meta = self._queue_meta_cache.get(item_id, {}) if item_id else {}
             item_title = item_title or cached_meta.get("title")
-            item_artist = item.get("uploader") if isinstance(item.get("uploader"), str) else cached_meta.get("artist")
+            item_artist = (
+                item.get("uploader")
+                if isinstance(item.get("uploader"), str)
+                else cached_meta.get("artist")
+            )
             if not isinstance(item_artist, str):
                 item_artist = None
             item_duration = item_duration or cached_meta.get("duration")
             item_raw_thumb = item_raw_thumb or cached_meta.get("thumb")
             item_thumb = self._resolve_thumb(item_id, item_raw_thumb)
-            queue.append({
-                "id": item_id,
-                "title": item_title,
-                "artist": item_artist,
-                "duration": item_duration,
-                "thumb": item_thumb,
-            })
-        title_val = self._mpv(["get_property", "media-title"]) or current.get("title")
-        artist_val = current.get("uploader") if isinstance(current.get("uploader"), str) else None
+            queue.append(
+                {
+                    "id": item_id,
+                    "title": item_title,
+                    "artist": item_artist,
+                    "duration": item_duration,
+                    "thumb": item_thumb,
+                }
+            )
+        # Prefer cached metadata for current track (set by _play_now or queue hydration)
+        cached_current = (
+            self._current_meta
+            if self._current_meta.get("id") == vid
+            else self._queue_meta_cache.get(vid, {})
+        )
+        title_val = (
+            cached_current.get("title")
+            or self._mpv(["get_property", "media-title"])
+            or current.get("title")
+        )
+        artist_val = cached_current.get("artist") or (
+            current.get("uploader")
+            if isinstance(current.get("uploader"), str)
+            else None
+        )
         dur_val = self._mpv(["get_property", "duration"])
         pos_val = self._mpv(["get_property", "time-pos"])
         vol_val = self._mpv(["get_property", "volume"])
@@ -539,7 +657,9 @@ class PlayerDaemon:
                             new_vol = v
                         else:
                             try:
-                                cur_vol = int(self._mpv(["get_property", "volume"]) or 50)
+                                cur_vol = int(
+                                    self._mpv(["get_property", "volume"]) or 50
+                                )
                             except Exception:
                                 cur_vol = 50
                             new_vol = max(0, min(100, cur_vol + v))
@@ -646,7 +766,7 @@ class PlayerDaemon:
                 while not self.stop.is_set():
                     try:
                         conn, _ = server.accept()
-                    except socket.timeout:
+                    except TimeoutError:
                         continue
                     except OSError:
                         break
@@ -665,7 +785,10 @@ class PlayerDaemon:
                     except Exception as exc:
                         print(f"[myx] command client error: {exc}", file=sys.stderr)
             except Exception as exc:
-                print(f"[myx] command server error: {exc}, retrying in {backoff}s", file=sys.stderr)
+                print(
+                    f"[myx] command server error: {exc}, retrying in {backoff}s",
+                    file=sys.stderr,
+                )
                 time.sleep(backoff)
                 backoff = min(30, backoff * 2)
             finally:
@@ -675,12 +798,19 @@ class PlayerDaemon:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    if not argv:
-        print("usage: python -m myx.player <url>", file=sys.stderr)
+    no_lyrics = "--no-lyrics" in argv
+    idle = "--idle" in argv
+    argv = [a for a in argv if a not in ("--no-lyrics", "--idle")]
+    if not argv and not idle:
+        print(
+            "usage: python -m myx.player <url> [--idle] [--no-lyrics]", file=sys.stderr
+        )
         return 2
-    daemon = PlayerDaemon(argv[0])
+    daemon = PlayerDaemon(argv[0] if argv else None, no_lyrics=no_lyrics)
+
     def _term(_signum: int, _frame: Any) -> None:
         daemon.stop.set()
+
     signal.signal(signal.SIGTERM, _term)
     signal.signal(signal.SIGINT, _term)
     daemon.run()

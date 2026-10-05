@@ -32,8 +32,8 @@ def _run_ytdlp(args: list[str]) -> str:
     except OSError as exc:
         raise SourcesError(f"could not run yt-dlp: {exc}") from exc
     if proc.returncode != 0:
-        msg = (proc.stderr or proc.stdout or "yt-dlp failed").strip().splitlines()[-1]
-        raise SourcesError(msg)
+        lines = (proc.stderr or proc.stdout or "yt-dlp failed").strip().splitlines()
+        raise SourcesError(lines[-1] if lines else "yt-dlp failed")
     return proc.stdout
 
 
@@ -59,29 +59,35 @@ def _shape(entry: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": entry.get("id"),
         "title": entry.get("title"),
-        "artist": _clean_artist(entry.get("uploader") or entry.get("channel") or entry.get("artist")),
+        "artist": _clean_artist(
+            entry.get("uploader") or entry.get("channel") or entry.get("artist")
+        ),
         "duration": entry.get("duration"),
         "thumb": _thumb(entry),
     }
 
 
 def search(q: str) -> list[dict[str, Any]]:
-    data = json.loads(_run_ytdlp(["--dump-single-json", "--no-warnings", f"ytsearch20:{q}"]))
+    data = json.loads(
+        _run_ytdlp(["--dump-single-json", "--no-warnings", f"ytsearch20:{q}"])
+    )
     return [_shape(e) for e in data.get("entries", []) if isinstance(e, dict)]
 
 
 def mix_chain(video_id: str) -> list[str]:
     url = f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}"
-    out = _run_ytdlp([
-        "--flat-playlist",
-        "--playlist-end",
-        "25",
-        "--no-warnings",
-        "-j",
-        "--extractor-args",
-        "youtube:player_client=web,music",
-        url,
-    ])
+    out = _run_ytdlp(
+        [
+            "--flat-playlist",
+            "--playlist-end",
+            "25",
+            "--no-warnings",
+            "-j",
+            "--extractor-args",
+            "youtube:player_client=web,music",
+            url,
+        ]
+    )
     ids: list[str] = []
     for line in out.splitlines():
         if not line.strip():
@@ -97,20 +103,30 @@ def mix_chain(video_id: str) -> list[str]:
 
 
 def meta(video_id: str) -> dict[str, Any]:
-    data = json.loads(_run_ytdlp(["--dump-single-json", "--no-warnings", f"https://www.youtube.com/watch?v={video_id}"]))
+    data = json.loads(
+        _run_ytdlp(
+            [
+                "--dump-single-json",
+                "--no-warnings",
+                f"https://www.youtube.com/watch?v={video_id}",
+            ]
+        )
+    )
     return _shape(data)
 
 
 def stream_url(video_id: str) -> str:
     """Resolve a direct bestaudio CDN URL (IPv4-forced for reliable streaming)."""
-    out = _run_ytdlp([
-        "--force-ipv4",
-        "--no-warnings",
-        "--get-url",
-        "-f",
-        "bestaudio",
-        f"https://www.youtube.com/watch?v={video_id}",
-    ])
+    out = _run_ytdlp(
+        [
+            "--force-ipv4",
+            "--no-warnings",
+            "--get-url",
+            "-f",
+            "bestaudio",
+            f"https://www.youtube.com/watch?v={video_id}",
+        ]
+    )
     for line in reversed(out.splitlines()):
         line = line.strip()
         if line.startswith("http"):
@@ -135,7 +151,9 @@ def cache_thumb(url_or_id: str, thumb_url: str) -> str:
     return str(path)
 
 
-def lyrics(title: str, artist: str, duration_s: int | float | None = None) -> dict[str, str | None]:
+def lyrics(
+    title: str, artist: str, duration_s: float | None = None
+) -> dict[str, str | None]:
     params: dict[str, str] = {"track_name": title, "artist_name": artist}
     if duration_s is not None:
         params["duration"] = str(int(duration_s))

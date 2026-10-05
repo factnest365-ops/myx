@@ -2,8 +2,10 @@ import io
 import json
 import os
 import pty
+import re
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 
 from myx import tui
@@ -23,8 +25,20 @@ def mock_state(tmp_path: Path) -> Path:
         "position": 11,
         "volume": 100,
         "queue": [
-            {"id": "2", "title": "Holiday", "artist": "Green Day", "duration": 232, "thumb": None},
-            {"id": "3", "title": "Never Fade Away", "artist": "SAMURAI", "duration": 205, "thumb": None},
+            {
+                "id": "2",
+                "title": "Holiday",
+                "artist": "Green Day",
+                "duration": 232,
+                "thumb": None,
+            },
+            {
+                "id": "3",
+                "title": "Never Fade Away",
+                "artist": "SAMURAI",
+                "duration": 205,
+                "thumb": None,
+            },
         ],
         "lrc": "[00:10.00]Call out my name\n[00:20.00]When I kiss you",
     }
@@ -38,7 +52,7 @@ def test_render_one_frame_to_buffer_from_mock_state(tmp_path):
     out = io.StringIO()
     renderer = tui.Renderer(state_path=state_path, out=out)
 
-    frame = renderer.render_once(size=(100, 32))
+    frame = renderer.render_once(size=(120, 32))
 
     assert "M Y X" in frame
     assert "Call Out My Name" in frame
@@ -62,7 +76,7 @@ from pathlib import Path
 from myx import tui
 r = tui.Renderer(state_path=Path({str(state_path)!r}), out=sys.stdout)
 for _ in range(3):
-    r.render_once(size=(100, 32))
+    r.render_once(size=(120, 32))
 """
     master, slave = pty.openpty()
     try:
@@ -89,3 +103,236 @@ for _ in range(3):
         os.close(master)
     assert proc.returncode == 0, err.decode(errors="ignore")
     assert tui.FOOTER in output
+
+
+_ANSI_INDEP = re.compile(
+    r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b_[^\x1b]*\x1b\\"
+)
+
+
+def _independent_disp_width(line: str) -> int:
+    """Terminal width of a rendered line; independent of myx.tui helpers."""
+    plain = _ANSI_INDEP.sub("", line)
+    total = 0
+    for ch in plain:
+        if unicodedata.combining(ch):
+            continue
+        total += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return total
+
+
+def test_cell_len_counts_wide_chars():
+    assert tui.cell_len("abc") == 3
+    assert tui.cell_len("日本語") == 6
+    assert tui.cell_len("夜に駆ける") == 10
+    assert tui.cell_len(tui.fg("accent") + "ab") == 2
+    assert tui.cell_len("🔀") == 2
+
+
+def test_crop_and_pad_are_cell_aware():
+    assert tui.crop("日本語", 4) == "日本"
+    assert tui.crop("日本語", 5) == "日本"
+    assert tui.pad("日", 4) == "日  "
+    assert tui.pad("abc", 4) == "abc "
+
+
+def test_clip_keeps_ansi_and_drops_overflow():
+    s = tui.fg("dim") + "abcdef" + tui.RESET
+    out = tui.clip(s, 3)
+    assert out.startswith(tui.fg("dim"))
+    assert out.endswith(tui.RESET)
+    assert tui.cell_len(out) == 3
+    assert "abc" in out and "def" not in out
+    # image-protocol escapes must survive clipping untouched
+    osc = "\x1b]1337;File=inline=1:QUJD\a"
+    assert tui.clip(osc, 0) == ""
+    assert tui.strip_ansi(osc) == ""
+
+
+def test_narrow_terminal_lines_fit_width():
+    """Every rendered line must fit the terminal (footer overflow + CJK widths)."""
+    state = {
+        "version": 1,
+        "playing": True,
+        "paused": False,
+        "title": "夜に駆ける (YOASOBI) 完全版",
+        "artist": "YOASOBI",
+        "id": "x",
+        "thumb": None,
+        "duration": 200,
+        "position": 10,
+        "queue": [
+            {
+                "id": "2",
+                "title": "打上花火 (DAOKO × 米津玄師)",
+                "artist": "DAOKO",
+                "duration": 180,
+                "thumb": None,
+            },
+            {
+                "id": "3",
+                "title": "Album 🔀 Unshuffle",
+                "artist": "Artist",
+                "duration": 90,
+                "thumb": None,
+            },
+        ],
+    }
+    out = io.StringIO()
+    renderer = tui.Renderer(out=out)
+    frame = renderer.render_once(state=state, size=(80, 24))
+    lines = frame.split("\n")
+    assert len(lines) == 24
+    for i, line in enumerate(lines):
+        w = _independent_disp_width(line)
+        assert w <= 80, f"line {i} is {w} cells wide (max 80): {line!r}"
+
+
+def test_wide_terminal_keeps_full_footer():
+    state = {"version": 1, "playing": True, "title": "Song", "artist": "A", "queue": []}
+    renderer = tui.Renderer(out=io.StringIO())
+    frame = renderer.render_once(state=state, size=(120, 32))
+    footer_lines = [l for l in frame.split("\n") if "type to search" in l]
+    assert footer_lines
+    assert tui.FOOTER in footer_lines[0]
+
+
+def test_tiny_terminal_renders_at_true_size():
+    """A 40x15 terminal must render 40x15, not a clamped 60x20 garble."""
+    state = {
+        "version": 1,
+        "playing": True,
+        "paused": False,
+        "title": "Short",
+        "artist": "A",
+        "id": "x",
+        "thumb": None,
+        "duration": 100,
+        "position": 5,
+        "queue": [
+            {"id": "2", "title": "Next", "artist": "B", "duration": 90, "thumb": None}
+        ],
+    }
+    renderer = tui.Renderer(out=io.StringIO())
+    frame = renderer.render_once(state=state, size=(40, 15))
+    lines = frame.split("\n")
+    assert len(lines) == 15
+    for i, line in enumerate(lines):
+        w = _independent_disp_width(line)
+        assert w <= 40, f"line {i} is {w} cells wide (max 40): {line!r}"
+
+
+def test_art_cache_key_includes_cell_size(monkeypatch):
+    """Resizing the terminal must re-render art at the new size."""
+    monkeypatch.setattr(
+        tui.ArtRenderer, "detect_protocol", lambda self, env=None: "half-block"
+    )
+    monkeypatch.setattr(
+        tui.ArtRenderer,
+        "_half_block",
+        lambda self, path, cells, rows: [f"HB-{cells}x{rows}"],
+    )
+    art = tui.ArtRenderer()
+    first = art.render("/does/not/matter.jpg", 20, 10)
+    again = art.render("/does/not/matter.jpg", 20, 10)
+    resized = art.render("/does/not/matter.jpg", 30, 15)
+    assert first == ["HB-20x10"]
+    assert again == first, "same size must hit the cache"
+    assert resized == ["HB-30x15"], "size change must re-render, not serve stale cache"
+
+
+def test_auto_hint_toast_clears_after_recovery():
+    """The empty-state doctor hint must not stick once playback resumes."""
+    r = tui.Renderer(out=io.StringIO())
+    empty = {"playing": False, "title": "MYX", "queue": []}
+    r.render_once(state=empty, size=(100, 32))
+    assert r.toast == tui.AUTO_HINT
+    playing = {
+        "playing": True,
+        "title": "Song",
+        "queue": [
+            {"id": "1", "title": "Song", "artist": "A", "duration": 90, "thumb": None}
+        ],
+    }
+    frame = r.render_once(state=playing, size=(100, 32))
+    assert r.toast == "", "stale auto hint must clear on recovery"
+    assert "Updating player" not in frame
+
+
+def test_daemon_search_shows_queued_note_not_no_results(monkeypatch):
+    monkeypatch.setattr(
+        tui, "send_command", lambda cmd, **kw: {"ok": True, "queued": 3}
+    )
+    r = tui.Renderer(out=io.StringIO())
+    r.open_search()
+    r.picker.set_query("hello", now=100.0)
+    r._maybe_fire_search(now=101.0)
+    assert r._search_note == "queued 3 — added to queue"
+    assert r.picker.results == []
+    frame = r.render_once(
+        state={"playing": False, "title": "MYX", "queue": []}, size=(100, 32)
+    )
+    assert "added to queue" in frame
+    assert "No results" not in frame
+
+
+def test_enter_does_not_double_queue_after_daemon_search(monkeypatch):
+    calls: list = []
+
+    def fake_send(cmd, **kw):
+        calls.append(cmd)
+        return {"ok": True, "queued": 3}
+
+    monkeypatch.setattr(tui, "send_command", fake_send)
+    r = tui.Renderer(out=io.StringIO())
+    r.open_search()
+    r.picker.set_query("hello", now=100.0)
+    r._maybe_fire_search(now=101.0)
+    assert len(calls) == 1
+    r.handle_key("\r")
+    assert len(calls) == 1, "Enter re-fired search and double-queued"
+    assert r.overlay is None
+    assert r.toast == "queued 3 — added to queue"
+
+
+def test_search_note_clears_when_query_changes(monkeypatch):
+    monkeypatch.setattr(
+        tui, "send_command", lambda cmd, **kw: {"ok": True, "queued": 3}
+    )
+    r = tui.Renderer(out=io.StringIO())
+    r.open_search()
+    r.picker.set_query("hello", now=100.0)
+    r._maybe_fire_search(now=101.0)
+    assert r._search_note
+    r.handle_key("z")
+    assert r._search_note == ""
+
+
+def test_header_keeps_brand_accent_and_bold():
+    """Tabs used to overwrite row 0 and strip the M Y X accent/bold."""
+    r = tui.Renderer(out=io.StringIO())
+    state = {
+        "playing": True,
+        "title": "Song",
+        "queue": [
+            {"id": "1", "title": "Song", "artist": "A", "duration": 90, "thumb": None}
+        ],
+    }
+    line0 = r.render_once(state=state, size=(100, 32)).split("\n")[0]
+    assert "M Y X" in line0
+    assert tui.BOLD in line0, "header brand accent/bold was stripped by the tabs put"
+
+
+def test_toast_wins_over_controls_hint_row():
+    r = tui.Renderer(out=io.StringIO())
+    r.toast = "Hi there"
+    state = {
+        "playing": True,
+        "title": "Song",
+        "queue": [
+            {"id": "1", "title": "Song", "artist": "A", "duration": 90, "thumb": None}
+        ],
+    }
+    row = r.render_once(state=state, size=(100, 32)).split("\n")[30]
+    assert "Hi there" in row
+    assert "▶ Play" not in row, "controls hint must not share the toast row"
