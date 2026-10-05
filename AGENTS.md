@@ -27,17 +27,20 @@ Free-stack only: Python + mpv (playback/IPC) + yt-dlp (streams, search, metadata
 
 ### myx/player.py - PlayerDaemon (runs standalone: `python -m myx.player <url>`)
 - Spawns `mpv --input-ipc-server=$TMPDIR/myx-mpv.sock --idle=yes --no-video --no-ytdl`.
-- JSON IPC over that socket (stdlib socket, no python-mpv dep). Commands in: toggle/pause/resume/skip/prev/vol N/shuffle/play_id ID/load URL/jump POS/quit.
-- Refill loop thread: when queue <= 2, mix_chain(current) -> filter seen-set -> loadfile append each; mark_seen on successful append; eager fill at start; retry/backoff on yt-dlp failure; never let mpv go idle while tracks exist.
-- State out: writes atomically every tick (>=4 Hz while playing) to `$TMPDIR/myx-state.json`: `{version, playing(bool), paused, title, artist, id, url, thumb(path|None), duration, position, volume, queue:[{id,title,duration,thumb}]}`.
+- JSON IPC over that socket (stdlib socket, no python-mpv dep). Commands in: toggle/pause/resume/skip/prev/vol N/shuffle/play_id ID/load URL/jump POS/del/play_index/quit.
+- JIT Queue & 2-track MPV buffer: MPV maintains a 2-track buffer (Track 0 currently playing, Track 1 pre-resolved next track for gapless transitions); remaining items (Tracks 2..N) are held in daemon memory as lightweight metadata (`id`, `title`, `artist`, `duration`, `thumb`, `stream_url=None`) with non-blocking stream resolution just-in-time as tracks approach playback.
+- Non-blocking IPC commands: `play_id`, `load`, and `search` return immediately; `play_id` triggers background radio refill via `_refill_loop` without blocking `handle_command`.
+- Refill loop thread: when queue <= 3, `mix_chain_items(current)` -> filter seen-set -> append metadata to queue; eager fill at start; retry/backoff on yt-dlp failure.
+- Non-blocking state out: writes atomically every tick (>=4 Hz while playing) to `$TMPDIR/myx-state.json`. Uncached thumbnails and lyrics resolve in background threads without blocking the 250ms tick loop.
 - Command server: listen `$TMPDIR/myx-cmd.sock`, one JSON cmd per line, reply `{"ok":true}` or `{"ok":false,"error":"..."}`.
 - Singleton lockfile at `$TMPDIR/myx.lock`; healthcheck loop restarts mpv on death/unresponsiveness; EOF watchdog kicks stalled tracks.
 
 ### myx/mcp.py - MCP server (stdio JSON-RPC 2.0, no external deps)
-- Exposes 14 tools over stdio by wrapping the daemon IPC + reading `$TMPDIR/myx-state.json`. Does not own playback.
+- Exposes 15 tools over stdio by wrapping the daemon IPC + reading `$TMPDIR/myx-state.json`. Does not own playback.
 - Server identity: `myx` v0.2.0, protocol `2024-11-05`.
 - Tools:
-  - `myx_play(url)` — play a YouTube URL or video id; boots daemon if not running; falls back to direct mpv.
+  - `myx_play(url|query)` — play a YouTube URL, video ID, or search query (e.g. 'blinding lights'); boots daemon if not running; falls back to direct mpv.
+  - `myx_queue_add(url|query)` — enqueue a track by search query, YouTube URL, or video ID.
   - `myx_search(query)` — ytsearch20, enqueues all results; if daemon unreachable, returns results without enqueueing.
   - `myx_state` — current player state (playing/paused, title/artist, position/duration, volume, queue, lyrics).
   - `myx_queue` — upcoming tracks + current.

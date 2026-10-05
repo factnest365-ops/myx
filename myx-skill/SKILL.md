@@ -20,12 +20,13 @@ Or without MCP, just shell it:
 myx "https://www.youtube.com/watch?v=dQw4w9WgXcQ"   # play + start radio
 myx --search "lofi hip hop"                       # search → enqueue
 myx --state                                       # JSON state (agent polling)
-myx mcp                                           # stdio MCP server (14 tools)
+myx mcp                                           # stdio MCP server (15 tools)
 ```
 
 ## MCP tools (via `mcp__myx__*` when connected)
 
-- `myx_play(url)` — play a YouTube/YT Music URL or video id (boots daemon if needed)
+- `myx_play(url|query)` — play a YouTube/YT Music URL, video ID, or search query (e.g. 'blinding lights')
+- `myx_queue_add(url|query)` — enqueue a track by search query, YouTube URL, or video ID
 - `myx_search(query)` — ytsearch20 + enqueue, returns `queued` count
 - `myx_state()` — full state: playing/paused, title/artist, position/duration, volume, queue, lyrics (lrc/plain)
 - `myx_queue()` — upcoming queue

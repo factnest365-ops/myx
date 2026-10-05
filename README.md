@@ -127,9 +127,9 @@ err = "#ff4444"
 ## Architecture
 
 - `myx/sources.py` — pure functions over `yt-dlp` JSON + `lrclib` (`search`, `mix_chain`, `meta`, `cache_thumb`, `lyrics`; 20 s timeout; `SourcesError`).
-- `myx/player.py` — `PlayerDaemon` (`python -m myx.player <url>`): spawns `mpv --input-ipc-server=$TMPDIR/myx-mpv.sock --idle=yes --no-video --no-ytdl`, JSON IPC, refill loop, atomic `$TMPDIR/myx-state.json` at ≥ 4 Hz, command server on `$TMPDIR/myx-cmd.sock` (JSON per line).
+- `myx/player.py` — `PlayerDaemon` (`python -m myx.player <url>`): manages playback via `mpv --input-ipc-server=$TMPDIR/myx-mpv.sock --idle=yes --no-video --no-ytdl`, maintains a JIT 2-track buffer in MPV (Track 0 playing, Track 1 pre-resolved next; remaining items held in memory as metadata with on-demand stream resolution), non-blocking IPC commands (`play_id`, `load`, `search`), background radio refill via mix chain, non-blocking thumbnail and lyrics resolution, atomic `$TMPDIR/myx-state.json` at ≥ 4 Hz, and command server on `$TMPDIR/myx-cmd.sock` (JSON per line).
 - `myx/tui.py` — alt-screen 12 fps renderer: reads state file, writes command socket, owns zero playback logic.
-- `myx/mcp.py` — stdio MCP server (JSON-RPC 2.0, no deps): exposes 14 tools over stdio by wrapping the same daemon IPC + `myx-state.json`. Agent-native, TUI-optional.
+- `myx/mcp.py` — stdio MCP server (JSON-RPC 2.0, no deps): exposes 15 tools over stdio by wrapping the same daemon IPC + `myx-state.json`. Agent-native, TUI-optional.
 - `myx/cli.py` — entrypoint, single-instance lockfile, bin checks, `--search` / `--lyrics-only`, headless controls (`--quit`, `--skip`, `--prev`, `--toggle`, `--vol`), `--no-lyrics`, plus agent-friendly `myx --state` and `myx mcp`.
 
 ## Agent-native (MCP)
@@ -140,7 +140,7 @@ MYX is built agent-first: the TUI is a view, the daemon is the API. Agents don't
 myx --state              # pollable JSON — title/artist/position/queue/lyrics
 myx --no-lyrics URL      # skip lyrics fetching in headless or agent mode
 myx --skip               # headless playback controls also include --quit, --prev, --toggle, --vol N
-myx mcp --stdio          # stdio MCP server — 14 tools
+myx mcp --stdio          # stdio MCP server — 15 tools
 myx "https://..."        # still works headless — mpv + yt-dlp, no TUI needed
 ```
 
@@ -154,7 +154,7 @@ Add to `~/.jcode/mcp.json` (jcode already has MYX installed):
 
 Skill is at `~/.jcode/skills/myx/SKILL.md` — auto-loaded. Any jcode agent can then call `myx_search`, `myx_play`, `myx_state`, etc. Also `myx-skill/SKILL.md` in the MYX repo for sharing.
 
-**MCP tools:** `myx_play(url)` · `myx_search(query)` · `myx_state` · `myx_queue` · `myx_skip`/`myx_prev` · `myx_pause`/`myx_resume`/`myx_toggle` · `myx_volume(volume|delta)` · `myx_shuffle` · `myx_lyrics` · `myx_remove(index)` · `myx_play_index(index)` — all backed by the daemon's `myx-cmd.sock` + `myx-state.json`; none touch the TUI.
+**MCP tools:** `myx_play(url|query)` · `myx_queue_add(url|query)` · `myx_search(query)` · `myx_state` · `myx_queue` · `myx_skip`/`myx_prev` · `myx_pause`/`myx_resume`/`myx_toggle` · `myx_volume(volume|delta)` · `myx_shuffle` · `myx_lyrics` · `myx_remove(index)` · `myx_play_index(index)` — all backed by the daemon's `myx-cmd.sock` + `myx-state.json`; none touch the TUI.
 
 ## Security & Threat Model
 
