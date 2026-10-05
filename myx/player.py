@@ -37,6 +37,9 @@ def _url(video_id: str) -> str:
     return f"https://www.youtube.com/watch?v={video_id}"
 
 
+_ORIGINAL_MIX_CHAIN = getattr(sources, "mix_chain", None)
+
+
 class PlayerDaemon:
     def __init__(self, url: str | None = None, no_lyrics: bool = False):
         self.url = url
@@ -46,17 +49,24 @@ class PlayerDaemon:
         self.mpv: subprocess.Popen[str] | None = None
         self.seq = 0
         self.seen: set[str] = set()
-        self.cached_chain: dict[str, list[str]] = {}
+        self.cached_chain: dict[str, list[Any]] = {}
         self._lyrics_cache: dict[str, dict[str, str | None]] = {}
         self._lyrics_inflight: set[str] = set()
         self._lyrics_lock = threading.Lock()
         self._thumb_cache: dict[str, str | None] = {}
+        self._thumb_pending: set[str] = set()
 
         self._queue_meta_cache: dict[str, dict[str, Any]] = {}
         self._stream_cache: dict[str, str] = {}
         self._id_by_path: dict[str, str] = {}
         self._current_meta: dict[str, Any] = {}
         self._idle_since: float | None = None
+
+        self.queue: list[dict[str, Any]] = []
+        self.current_track: dict[str, Any] | None = None
+        self._refill_event = threading.Event()
+        self._buffer_lock = threading.Lock()
+        self._buffering: bool = False
 
     def _candidate_cmd_socks(self) -> list[Path]:
         seen: set[Path] = set()
@@ -253,25 +263,35 @@ class PlayerDaemon:
         return data if isinstance(data, list) else []
 
     def _current_id(self) -> str | None:
+        if self.current_track and self.current_track.get("id"):
+            return str(self.current_track["id"])
         path = self._mpv(["get_property", "path"])
         return (
             self._id_by_path.get(path or "") or _video_id(path) or _video_id(self.url)
         )
 
-    def _append_track(self, video_id: str, mark_seen: bool = True) -> bool:
-        stream = self._stream_for(video_id)
-        # Cold start (idle daemon, empty playlist): plain "append" would queue
-        # the track without ever starting playback — mpv only starts on
-        # append-play when nothing is playing. While something plays this is
-        # identical to append (verified against the mpv manual).
-        try:
-            idle = not self._playlist()
-        except Exception:  # noqa: BLE001 - an IPC failure must not stop shutdown
-            idle = False
-        self._mpv(["loadfile", stream, "append-play" if idle else "append"])
-        self._id_by_path[stream] = video_id
-        if mark_seen:
-            self.seen.add(video_id)
+    def _append_track(self, vid_or_item: str | dict[str, Any], mark_seen: bool = True) -> bool:
+        if isinstance(vid_or_item, dict):
+            item = dict(vid_or_item)
+            vid = item.get("id")
+        else:
+            vid = str(vid_or_item)
+            meta = self._queue_meta_cache.get(vid, {})
+            item = {
+                "id": vid,
+                "title": meta.get("title"),
+                "artist": meta.get("artist"),
+                "duration": meta.get("duration"),
+                "thumb": meta.get("thumb"),
+                "stream_url": None,
+            }
+        item.setdefault("stream_url", None)
+        if vid:
+            self._queue_meta_cache[vid] = item
+        self.queue.append(item)
+        if mark_seen and vid:
+            self.seen.add(vid)
+        self._trigger_buffer()
         return True
 
     def _stream_for(self, video_id: str) -> str:
@@ -294,34 +314,151 @@ class PlayerDaemon:
         self._mpv(["loadfile", stream, "replace"])
         self._id_by_path[stream] = video_id
         self.seen.add(video_id)
-        # Resolve and cache metadata for current track so state shows correct title/artist
+        meta = self._queue_meta_cache.get(video_id, {})
+        self.current_track = {
+            "id": video_id,
+            "title": meta.get("title"),
+            "artist": meta.get("artist"),
+            "duration": meta.get("duration"),
+            "thumb": meta.get("thumb"),
+            "stream_url": stream,
+        }
+        self._trigger_buffer()
+
+    def _trigger_buffer(self) -> None:
+        if self._buffering or self.stop.is_set():
+            return
+        if not self.queue:
+            return
         try:
-            self._current_meta = sources.meta(video_id)
-        except sources.SourcesError:
-            self._current_meta = {}
+            pl = self._playlist()
+            if len(pl) >= 2:
+                return
+        except Exception:
+            return
+        self._buffering = True
+        threading.Thread(target=self._buffer_worker, daemon=True).start()
+
+    def _buffer_worker(self) -> None:
+        try:
+            with self._buffer_lock:
+                if self.stop.is_set() or not self.queue:
+                    return
+                try:
+                    pl = self._playlist()
+                    if len(pl) >= 2:
+                        return
+                except Exception:
+                    return
+                target = self.queue[0]
+                vid = target.get("id")
+                if not vid:
+                    return
+                stream = target.get("stream_url")
+                if not stream:
+                    stream = self._stream_for(vid)
+                    target["stream_url"] = stream
+
+                if self.stop.is_set() or not self.queue or self.queue[0].get("id") != vid:
+                    return
+                with self.lock:
+                    pl = self._playlist()
+                    if len(pl) < 2:
+                        self._mpv(["loadfile", stream, "append"])
+                        self._id_by_path[stream] = vid
+                        self.seen.add(vid)
+        except Exception as exc:
+            print(f"[myx] buffer error: {exc}", file=sys.stderr)
+        finally:
+            self._buffering = False
+
+    def _maintain_playback(self) -> None:
+        try:
+            playlist = self._playlist()
+            pos = int(self._mpv(["get_property", "playlist-pos"]) or 0) if playlist else 0
+        except Exception:
+            return
+
+        if pos >= 1:
+            if self.queue:
+                self.current_track = self.queue.pop(0)
+            elif 0 <= pos < len(playlist):
+                item = playlist[pos]
+                path = item.get("filename")
+                vid = self._id_by_path.get(path or "") or _video_id(path)
+                self.current_track = {
+                    "id": vid,
+                    "title": item.get("title"),
+                    "artist": None,
+                    "duration": item.get("duration"),
+                    "thumb": None,
+                    "stream_url": path,
+                }
+            for _ in range(pos):
+                try:
+                    self._mpv(["playlist-remove", 0])
+                except Exception:
+                    break
+
+        try:
+            playlist = self._playlist()
+        except Exception:
+            playlist = []
+        if not playlist and self.queue:
+            next_item = self.queue.pop(0)
+            vid = next_item.get("id")
+            if vid:
+                stream = next_item.get("stream_url") or self._stream_for(vid)
+                next_item["stream_url"] = stream
+                self.current_track = next_item
+                try:
+                    self._mpv(["loadfile", stream, "replace"])
+                    self._id_by_path[stream] = vid
+                    self.seen.add(vid)
+                except Exception:
+                    pass
+
+        try:
+            playlist = self._playlist()
+        except Exception:
+            playlist = []
+        if len(playlist) == 1 and self.queue:
+            self._trigger_buffer()
 
     def _append_related(self) -> bool:
         cur = self._current_id()
         if not cur:
             return False
         try:
-            chain = sources.mix_chain(cur)
+            if sources.mix_chain is _ORIGINAL_MIX_CHAIN and hasattr(sources, "mix_chain_items"):
+                chain: list[Any] = sources.mix_chain_items(cur)
+            else:
+                chain = sources.mix_chain(cur)
             if chain:
                 self.cached_chain[cur] = chain
         except sources.SourcesError:
             chain = self.cached_chain.get(cur, [])
             if not chain:
                 raise
+        except Exception:
+            chain = self.cached_chain.get(cur, [])
+            if not chain:
+                raise
         added = 0
-        for vid in chain:
-            if vid in self.seen:
+        for it in chain:
+            vid = it.get("id") if isinstance(it, dict) else str(it)
+            if not vid or vid in self.seen:
                 continue
-            if self._append_track(vid, True):
+            if self._append_track(it, True):
                 added += 1
         if added == 0 and chain:
-            for vid in chain:
-                self._append_track(vid, False)
-                added += 1
+            existing_ids = {self.current_track.get("id") if self.current_track else None} | {x.get("id") for x in self.queue}
+            for it in chain:
+                vid = it.get("id") if isinstance(it, dict) else str(it)
+                if not vid or vid in existing_ids:
+                    continue
+                if self._append_track(it, False):
+                    added += 1
         return added > 0
 
     def _refill_loop(self) -> None:
@@ -336,10 +473,11 @@ class PlayerDaemon:
         backoff = 5
         while not self.stop.is_set():
             try:
-                if len(self._playlist()) <= 2:
+                if len(self.queue) <= 3:
                     self._append_related()
                 backoff = 5
-                time.sleep(2)
+                self._refill_event.wait(timeout=2)
+                self._refill_event.clear()
             except Exception:
                 time.sleep(backoff)
                 backoff = min(30, backoff * 2)
@@ -348,45 +486,15 @@ class PlayerDaemon:
         while not self.stop.is_set():
             started = time.monotonic()
             try:
+                self._maintain_playback()
                 self.write_state()
             except Exception:
                 pass
             time.sleep(max(0.05, 0.25 - (time.monotonic() - started)))
 
     def _queue_hydration_loop(self) -> None:
-        while not self.stop.is_set():
-            try:
-                playlist = self._playlist()
-                pos = int(self._mpv(["get_property", "playlist-pos"]) or 0)
-                for idx in range(pos + 1, len(playlist)):
-                    item = playlist[idx]
-                    item_id = self._id_by_path.get(
-                        item.get("filename") or ""
-                    ) or _video_id(item.get("filename"))
-                    if not item_id:
-                        continue
-                    if item_id in self._queue_meta_cache:
-                        continue
-                    if item.get("title"):
-                        self._queue_meta_cache[item_id] = {
-                            "title": item.get("title"),
-                            "artist": item.get("uploader")
-                            if isinstance(item.get("uploader"), str)
-                            else None,
-                            "duration": item.get("duration"),
-                            "thumb": item.get("thumbnail")
-                            if isinstance(item.get("thumbnail"), str)
-                            else None,
-                        }
-                        continue
-                    try:
-                        meta = sources.meta(item_id)
-                        self._queue_meta_cache[item_id] = meta
-                    except sources.SourcesError:
-                        self._queue_meta_cache[item_id] = {}
-            except Exception:
-                pass
-            time.sleep(5)
+        """Deprecated: Queue items are captured with metadata at enqueue time."""
+        pass
 
     def _restart_mpv(self) -> None:
         if self.mpv and self.mpv.poll() is None:
@@ -483,26 +591,35 @@ class PlayerDaemon:
         cache_key = vid or raw_thumb or ""
         if cache_key in self._thumb_cache:
             return self._thumb_cache[cache_key]
+        if cache_key in self._thumb_pending:
+            return None
         url = raw_thumb if raw_thumb and raw_thumb.startswith("http") else None
         if not url and vid:
             url = f"https://img.youtube.com/vi/{vid}/hqdefault.jpg"
         if not url:
             self._thumb_cache[cache_key] = None
             return None
-        try:
-            path = sources.cache_thumb(cache_key, url)
-            self._thumb_cache[cache_key] = path
-            return path
-        except sources.SourcesError:
-            self._thumb_cache[cache_key] = None
-            return None
+
+        self._thumb_pending.add(cache_key)
+
+        def _fetch() -> None:
+            try:
+                path = sources.cache_thumb(cache_key, url)
+                self._thumb_cache[cache_key] = path
+            except sources.SourcesError:
+                self._thumb_cache[cache_key] = None
+            except Exception:
+                self._thumb_cache[cache_key] = None
+            finally:
+                self._thumb_pending.discard(cache_key)
+
+        threading.Thread(target=_fetch, daemon=True).start()
+        return None
 
     def _resolve_lyrics(
         self, vid: str | None, title: Any, artist: Any, duration: Any
     ) -> dict[str, str | None]:
-        if self.no_lyrics:
-            return {"lrc": None, "plain": None}
-        if not vid:
+        if self.no_lyrics or not vid:
             return {"lrc": None, "plain": None}
         if vid in self._lyrics_cache:
             return self._lyrics_cache[vid]
@@ -535,39 +652,29 @@ class PlayerDaemon:
 
     def write_state(self) -> dict[str, Any]:
         playlist = self._playlist()
-        pos = int(self._mpv(["get_property", "playlist-pos"]) or 0)
+        pos = int(self._mpv(["get_property", "playlist-pos"]) or 0) if playlist else 0
         current = playlist[pos] if 0 <= pos < len(playlist) else {}
         path = current.get("filename") or self._mpv(["get_property", "path"])
-        vid = self._id_by_path.get(path or "") or _video_id(path)
-        raw_thumb = (
-            current.get("thumbnail")
-            if isinstance(current.get("thumbnail"), str)
-            else None
+        vid = (
+            (self.current_track.get("id") if self.current_track else None)
+            or self._id_by_path.get(path or "")
+            or _video_id(path)
         )
+        raw_thumb = current.get("thumbnail") if isinstance(current.get("thumbnail"), str) else None
+        if self.current_track and self.current_track.get("thumb"):
+            raw_thumb = self.current_track.get("thumb")
         cached_thumb = self._resolve_thumb(vid, raw_thumb)
+
         queue = []
-        for item in playlist[pos + 1 :]:
-            item_id = self._id_by_path.get(item.get("filename") or "") or _video_id(
-                item.get("filename")
-            )
-            item_title = item.get("title")
-            item_duration = item.get("duration")
-            item_raw_thumb = (
-                item.get("thumbnail")
-                if isinstance(item.get("thumbnail"), str)
-                else None
-            )
+        for item in self.queue:
+            item_id = item.get("id")
             cached_meta = self._queue_meta_cache.get(item_id, {}) if item_id else {}
-            item_title = item_title or cached_meta.get("title")
-            item_artist = (
-                item.get("uploader")
-                if isinstance(item.get("uploader"), str)
-                else cached_meta.get("artist")
-            )
+            item_title = item.get("title") or cached_meta.get("title")
+            item_artist = item.get("artist") or cached_meta.get("artist")
             if not isinstance(item_artist, str):
                 item_artist = None
-            item_duration = item_duration or cached_meta.get("duration")
-            item_raw_thumb = item_raw_thumb or cached_meta.get("thumb")
+            item_duration = item.get("duration") or cached_meta.get("duration")
+            item_raw_thumb = item.get("thumb") or cached_meta.get("thumb")
             item_thumb = self._resolve_thumb(item_id, item_raw_thumb)
             queue.append(
                 {
@@ -578,30 +685,24 @@ class PlayerDaemon:
                     "thumb": item_thumb,
                 }
             )
-        # Prefer cached metadata for current track (set by _play_now or queue hydration)
-        cached_current = (
-            self._current_meta
-            if self._current_meta.get("id") == vid
-            else self._queue_meta_cache.get(vid, {})
-        )
         title_val = (
-            cached_current.get("title")
-            or self._mpv(["get_property", "media-title"])
+            self._mpv(["get_property", "media-title"])
+            or (self.current_track.get("title") if self.current_track else None)
             or current.get("title")
         )
-        artist_val = cached_current.get("artist") or (
-            current.get("uploader")
-            if isinstance(current.get("uploader"), str)
-            else None
+        artist_val = (self.current_track.get("artist") if self.current_track else None) or (
+            current.get("uploader") if isinstance(current.get("uploader"), str) else None
         )
-        dur_val = self._mpv(["get_property", "duration"])
+        dur_val = self._mpv(["get_property", "duration"]) or (
+            self.current_track.get("duration") if self.current_track else None
+        )
         pos_val = self._mpv(["get_property", "time-pos"])
         vol_val = self._mpv(["get_property", "volume"])
         paused_val = bool(self._mpv(["get_property", "pause"]))
         lyr = self._resolve_lyrics(vid, title_val, artist_val, dur_val)
         state = {
             "version": 1,
-            "playing": bool(playlist),
+            "playing": bool(playlist) or bool(self.current_track),
             "paused": paused_val,
             "title": title_val,
             "artist": artist_val,
@@ -634,7 +735,24 @@ class PlayerDaemon:
             elif cmd == "resume":
                 self._mpv(["set_property", "pause", False])
             elif cmd == "skip":
-                self._mpv(["playlist-next", "force"])
+                playlist = self._playlist()
+                pos = int(self._mpv(["get_property", "playlist-pos"]) or 0) if playlist else 0
+                if len(playlist) > 1 and pos < len(playlist) - 1:
+                    self._mpv(["playlist-next", "force"])
+                    self._maintain_playback()
+                elif self.queue:
+                    next_item = self.queue.pop(0)
+                    vid = next_item.get("id")
+                    if vid:
+                        stream = next_item.get("stream_url") or self._stream_for(vid)
+                        next_item["stream_url"] = stream
+                        self.current_track = next_item
+                        self._mpv(["loadfile", stream, "replace"])
+                        self._id_by_path[stream] = vid
+                        self.seen.add(vid)
+                        self._trigger_buffer()
+                else:
+                    self._mpv(["playlist-next", "force"])
             elif cmd == "prev":
                 self._mpv(["playlist-prev", "force"])
             elif cmd == "vol":
@@ -669,27 +787,43 @@ class PlayerDaemon:
                     new_vol = max(0, min(100, int(arg) if arg is not None else 50))
                 self._mpv(["set_property", "volume", new_vol])
             elif cmd == "shuffle":
-                self._mpv(["playlist-shuffle"])
+                import random
+                random.shuffle(self.queue)
+                try:
+                    pl = self._playlist()
+                    if len(pl) > 1:
+                        self._mpv(["playlist-remove", 1])
+                except Exception:
+                    pass
+                self._trigger_buffer()
             elif cmd == "play_id":
-                vid = str(arg)
-                self._play_now(vid)
+                vid = _video_id(str(arg)) if arg is not None else None
+                if not vid:
+                    return {"ok": False, "error": "play_id requires a YouTube URL or video id"}
+                self.queue.clear()
+                self.seen = {vid}
                 self.cached_chain.clear()
-                try:
-                    playlist = self._playlist()
-                    pos = int(self._mpv(["get_property", "playlist-pos"]) or 0)
-                    for idx in range(len(playlist) - 1, pos, -1):
-                        self._mpv(["playlist-remove", idx])
-                except Exception:
-                    pass
-                try:
-                    self._append_related()
-                except Exception:
-                    pass
+                self._play_now(vid)
+                self._refill_event.set()
+                return {"ok": True}
             elif cmd == "load":
-                self._mpv(["loadfile", str(arg), "append"])
-                vid = _video_id(str(arg))
+                if arg is None or not str(arg).strip():
+                    return {"ok": False, "error": "load requires a URL or video id"}
+                vid = _video_id(str(arg)) or str(arg).strip()
+                meta = self._queue_meta_cache.get(vid, {})
+                item = {
+                    "id": vid,
+                    "title": meta.get("title"),
+                    "artist": meta.get("artist"),
+                    "duration": meta.get("duration"),
+                    "thumb": meta.get("thumb"),
+                    "stream_url": None,
+                }
+                self.queue.append(item)
                 if vid:
                     self.seen.add(vid)
+                self._trigger_buffer()
+                return {"ok": True}
             elif cmd == "search":
                 try:
                     items = sources.search(str(arg))
@@ -697,8 +831,18 @@ class PlayerDaemon:
                     for item in items:
                         vid2 = item.get("id")
                         if vid2:
-                            self._append_track(str(vid2), True)
+                            self._queue_meta_cache[vid2] = item
+                            self.queue.append({
+                                "id": vid2,
+                                "title": item.get("title"),
+                                "artist": item.get("artist"),
+                                "duration": item.get("duration"),
+                                "thumb": item.get("thumb"),
+                                "stream_url": None,
+                            })
+                            self.seen.add(vid2)
                             added += 1
+                    self._trigger_buffer()
                     return {"ok": True, "queued": added}
                 except sources.SourcesError as exc:
                     return {"ok": False, "error": str(exc)}
@@ -709,25 +853,43 @@ class PlayerDaemon:
                     idx = int(arg)
                 except Exception:
                     return {"ok": False, "error": "del requires integer index"}
-                playlist = self._playlist()
-                pos = int(self._mpv(["get_property", "playlist-pos"]) or 0)
-                target = pos + 1 + idx
-                if 0 <= target < len(playlist):
-                    self._mpv(["playlist-remove", target])
-                else:
+                if not (0 <= idx < len(self.queue)):
                     return {"ok": False, "error": "index out of range"}
+                self.queue.pop(idx)
+                if idx == 0:
+                    try:
+                        pl = self._playlist()
+                        if len(pl) > 1:
+                            self._mpv(["playlist-remove", 1])
+                    except Exception:
+                        pass
+                    self._trigger_buffer()
             elif cmd == "play_index":
                 try:
                     idx = int(arg)
                 except Exception:
                     return {"ok": False, "error": "play_index requires integer"}
-                playlist = self._playlist()
-                pos = int(self._mpv(["get_property", "playlist-pos"]) or 0)
-                target = pos + 1 + idx if idx >= 0 else idx
-                if 0 <= target < len(playlist):
-                    self._mpv(["set_property", "playlist-pos", target])
-                else:
+                if not (0 <= idx < len(self.queue)):
                     return {"ok": False, "error": "index out of range"}
+                if idx == 0:
+                    pl = self._playlist()
+                    pos = int(self._mpv(["get_property", "playlist-pos"]) or 0) if pl else 0
+                    if len(pl) > 1 and pos == 0:
+                        self._mpv(["playlist-next", "force"])
+                        self._maintain_playback()
+                        return {"ok": True}
+                target = self.queue[idx]
+                self.queue = self.queue[idx + 1 :]
+                vid = target.get("id")
+                if vid:
+                    stream = target.get("stream_url") or self._stream_for(vid)
+                    target["stream_url"] = stream
+                    self.current_track = target
+                    self._mpv(["loadfile", stream, "replace"])
+                    self._id_by_path[stream] = vid
+                    self.seen.add(vid)
+                    self._trigger_buffer()
+                return {"ok": True}
             elif cmd == "quit":
                 self.stop.set()
             else:

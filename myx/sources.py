@@ -74,7 +74,7 @@ def search(q: str) -> list[dict[str, Any]]:
     return [_shape(e) for e in data.get("entries", []) if isinstance(e, dict)]
 
 
-def mix_chain(video_id: str) -> list[str]:
+def mix_chain_items(video_id: str) -> list[dict[str, Any]]:
     url = f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}"
     out = _run_ytdlp(
         [
@@ -88,7 +88,7 @@ def mix_chain(video_id: str) -> list[str]:
             url,
         ]
     )
-    ids: list[str] = []
+    items: list[dict[str, Any]] = []
     for line in out.splitlines():
         if not line.strip():
             continue
@@ -96,10 +96,13 @@ def mix_chain(video_id: str) -> list[str]:
             item = json.loads(line)
         except json.JSONDecodeError:
             continue
-        vid = item.get("id")
-        if vid:
-            ids.append(str(vid))
-    return ids
+        if isinstance(item, dict) and item.get("id"):
+            items.append(_shape(item))
+    return items
+
+
+def mix_chain(video_id: str) -> list[str]:
+    return [str(item["id"]) for item in mix_chain_items(video_id) if item.get("id")]
 
 
 def meta(video_id: str) -> dict[str, Any]:

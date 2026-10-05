@@ -157,6 +157,19 @@ def _url(video_id: str) -> str:
     return f"https://www.youtube.com/watch?v={video_id}"
 
 
+def _video_id(value: str | None) -> str | None:
+    if not value:
+        return None
+    import re
+    for pat in (r"[?&]v=([^&]+)", r"youtu\.be/([^?&/]+)", r"/shorts/([^?&/]+)", r"/embed/([^?&/]+)", r"/live/([^?&/]+)", r"/watch/([^?&/]+)"):
+        m = re.search(pat, value)
+        if m:
+            return m.group(1)
+    if re.fullmatch(r"[A-Za-z0-9_-]{6,}", value):
+        return value
+    return None
+
+
 _meta_cache: dict[str, dict[str, Any]] = {}
 
 
@@ -177,23 +190,7 @@ def _meta_with_timeout(video_id: str, timeout: float = 2.0) -> dict[str, Any] | 
 
 
 def _hydrate_queue(state: dict[str, Any]) -> dict[str, Any]:
-    queue = state.get("queue") or []
-    out: list[dict[str, Any]] = []
-    for item in queue:
-        item = dict(item)
-        if item.get("title") is None and item.get("id"):
-            vid = str(item["id"])
-            if vid not in _meta_cache:
-                _meta_cache[vid] = _meta_with_timeout(vid) or {}
-            meta = _meta_cache[vid]
-            if meta:
-                item.setdefault("title", meta.get("title"))
-                item.setdefault("artist", meta.get("artist"))
-                item.setdefault("duration", meta.get("duration"))
-                item.setdefault("thumb", meta.get("thumb"))
-        out.append(item)
-    state = dict(state)
-    state["queue"] = out
+    # Non-blocking: state provided by player daemon already contains metadata from JIT queue
     return state
 
 
@@ -246,13 +243,24 @@ def _spotify_search(q: str) -> list[dict[str, Any]]:
 TOOLS: list[dict[str, Any]] = [
     {
         "name": "myx_play",
-        "description": "Play a YouTube/YT Music URL or video id. Starts the radio; if daemon is running, appends and plays. Example: https://www.youtube.com/watch?v=dQw4w9WgXcQ or dQw4w9WgXcQ",
+        "description": "Play a YouTube URL, video id, or search query (e.g. 'blinding lights the weeknd'). Starts playback and radio.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "url": {"type": "string", "description": "YouTube URL or video id"}
+                "url": {"type": "string", "description": "YouTube URL, video id, or search query"},
+                "query": {"type": "string", "description": "Search query or YouTube URL/video id (alias for url)"},
             },
-            "required": ["url"],
+        },
+    },
+    {
+        "name": "myx_queue_add",
+        "description": "Add a track to the queue by search query, YouTube URL, or video ID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query or YouTube URL/video id"},
+                "url": {"type": "string", "description": "YouTube URL or video id (alias for query)"},
+            },
         },
     },
     {
@@ -367,79 +375,110 @@ def _tool_error(msg: str) -> dict[str, Any]:
 def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     try:
         if name == "myx_play":
-            url = str(args.get("url", "")).strip()
-            if not url:
-                return _tool_error("url required")
-            vid = None
-            import re as _re
-
-            for pat in (r"[?&]v=([^&]+)", r"youtu\.be/([^?&/]+)"):
-                m = _re.search(pat, url)
-                if m:
-                    vid = m.group(1)
-                    break
-            if _re.fullmatch(r"[A-Za-z0-9_-]{6,}", url):
-                vid = url
+            target = str(args.get("url") or args.get("query") or "").strip()
+            if not target:
+                return _tool_error("url or query required")
+            vid = _video_id(target)
+            search_title = None
+            if not vid:
+                try:
+                    items = sources.search(target)
+                    if items and items[0].get("id"):
+                        vid = str(items[0]["id"])
+                        search_title = items[0].get("title")
+                    else:
+                        return _tool_error(f"no search results found for: {target}")
+                except sources.SourcesError as e:
+                    return _tool_error(f"search failed: {e}")
+                except Exception as e:
+                    return _tool_error(f"search failed: {e}")
             try:
-                if vid:
-                    resp = _send_cmd("play_id", arg=vid)
-                    if resp.get("ok"):
-                        time.sleep(0.35)
-                        st = _read_state()
-                        if st.get("id") == vid and st.get("title"):
-                            return _tool_result(
-                                {
-                                    "ok": True,
-                                    "playing": st.get("title"),
-                                    "id": st.get("id"),
-                                    "state": st,
-                                }
-                            )
-                    try:
-                        _mpv_direct(["loadfile", _url(vid), "replace"])
-                        time.sleep(0.35)
-                        st = _read_state()
-                        return _tool_result(
-                            {
-                                "ok": True,
-                                "playing": st.get("title"),
-                                "id": st.get("id"),
-                                "state": st,
-                                "fallback": "mpv direct",
-                            }
-                        )
-                    except Exception as direct_exc:
-                        raise RuntimeError(
-                            f"daemon play failed, direct mpv failed: {direct_exc}"
-                        ) from direct_exc
-                else:
-                    resp = _send_cmd("load", arg=url)
-                    if resp.get("ok"):
-                        st0 = _read_state()
-                        qlen = len(st0.get("queue") or [])
-                        if qlen:
-                            _send_cmd("play_index", arg=qlen - 1)
-                        time.sleep(0.35)
-                        st = _read_state()
-                        return _tool_result(
-                            {
-                                "ok": True,
-                                "playing": st.get("title"),
-                                "id": st.get("id"),
-                                "state": st,
-                            }
-                        )
-                    return _tool_error(resp.get("error", "load failed"))
+                resp = _send_cmd("play_id", arg=vid)
+                if resp.get("ok"):
+                    time.sleep(0.05)
+                    st = _read_state()
+                    return _tool_result(
+                        {
+                            "ok": True,
+                            "playing": st.get("title") or search_title or vid,
+                            "id": vid,
+                            "state": st,
+                        }
+                    )
+                try:
+                    _mpv_direct(["loadfile", _url(vid), "replace"])
+                    time.sleep(0.05)
+                    st = _read_state()
+                    return _tool_result(
+                        {
+                            "ok": True,
+                            "playing": st.get("title") or search_title or vid,
+                            "id": vid,
+                            "state": st,
+                            "fallback": "mpv direct",
+                        }
+                    )
+                except Exception as direct_exc:
+                    return _tool_error(resp.get("error", f"play failed: {direct_exc}"))
             except Exception:
                 subprocess.Popen(
-                    [sys.executable, "-m", "myx.player", url],
+                    [sys.executable, "-m", "myx.player", vid],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-                time.sleep(0.8)
+                time.sleep(0.2)
                 st = _read_state()
                 return _tool_result(
-                    {"ok": True, "booted": True, "url": url, "state": st}
+                    {
+                        "ok": True,
+                        "booted": True,
+                        "id": vid,
+                        "playing": search_title or vid,
+                        "state": st,
+                    }
+                )
+
+        elif name == "myx_queue_add":
+            target = str(args.get("query") or args.get("url") or "").strip()
+            if not target:
+                return _tool_error("query or url required")
+            vid = _video_id(target)
+            item_title = None
+            if not vid:
+                try:
+                    items = sources.search(target)
+                    if items and items[0].get("id"):
+                        vid = str(items[0]["id"])
+                        item_title = items[0].get("title")
+                    else:
+                        return _tool_error(f"no search results found for: {target}")
+                except sources.SourcesError as e:
+                    return _tool_error(f"search failed: {e}")
+                except Exception as e:
+                    return _tool_error(f"search failed: {e}")
+            try:
+                resp = _send_cmd("load", arg=vid)
+                if resp.get("ok"):
+                    return _tool_result(
+                        {"ok": True, "queued": item_title or vid, "id": vid}
+                    )
+                return _tool_error(resp.get("error", "load failed"))
+            except Exception:
+                subprocess.Popen(
+                    [sys.executable, "-m", "myx.player", vid],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                time.sleep(0.2)
+                st = _read_state()
+                return _tool_result(
+                    {
+                        "ok": True,
+                        "booted": True,
+                        "queued": item_title or vid,
+                        "id": vid,
+                        "state": st,
+                    }
                 )
 
         elif name == "myx_search":
