@@ -48,6 +48,7 @@ def test_play_id_is_non_blocking_and_triggers_refill(monkeypatch):
         return f"https://cdn.example/{vid}.m8a"
 
     monkeypatch.setattr(sources, "stream_url", fake_stream_url)
+    monkeypatch.setattr(sources, "meta", lambda vid: {"id": vid, "title": "New Seed Title"})
 
     daemon = PlayerDaemon("https://www.youtube.com/watch?v=old_seed")
     daemon._mpv = MagicMock(return_value=None)
@@ -146,3 +147,66 @@ def test_write_state_is_non_blocking_with_uncached_lyrics_and_thumbs(monkeypatch
     assert st["title"] == "Playing Title"
     # Lyrics are initially None while background resolution runs
     assert st["lrc"] is None
+
+
+def test_force_media_title_is_sent_to_mpv(monkeypatch):
+    """Playing a track must send force-media-title to mpv for macOS MediaRemote."""
+    daemon = PlayerDaemon("https://www.youtube.com/watch?v=seed")
+    monkeypatch.setattr(sources, "stream_url", lambda vid: f"https://cdn/{vid}")
+    daemon._queue_meta_cache["seed"] = {"title": "Blinding Lights", "artist": "The Weeknd"}
+
+    mpv_cmds = []
+
+    def fake_mpv(cmd):
+        mpv_cmds.append(cmd)
+        return None
+
+    daemon._mpv = fake_mpv
+    daemon._play_now("seed")
+
+    assert ["set_property", "force-media-title", "Blinding Lights - The Weeknd"] in mpv_cmds
+
+
+def test_garbage_titles_rejected_in_write_state(monkeypatch, tmp_path):
+    """write_state must never let mpv container title 'web' or 'videoplayback' overwrite real title."""
+    import myx.player as player
+    monkeypatch.setattr(player, "STATE_PATH", tmp_path / "state.json")
+
+    daemon = PlayerDaemon("https://www.youtube.com/watch?v=seed")
+    daemon.current_track = {"id": "seed", "title": "Starboy", "artist": "The Weeknd"}
+
+    mpv_cmds = []
+
+    def fake_mpv(cmd):
+        mpv_cmds.append(cmd)
+        if cmd == ["get_property", "media-title"]:
+            return "web"  # YouTube WebM container title
+        if cmd == ["get_property", "playlist"]:
+            return [{"filename": "https://googlevideo.com/videoplayback?expire=123"}]
+        return None
+
+    daemon._mpv = fake_mpv
+    st = daemon.write_state()
+
+    # Title must remain "Starboy", not "web" or "videoplayback"
+    assert st["title"] == "Starboy"
+    # force-media-title should be sent to overwrite mpv's garbage title
+    assert ["set_property", "force-media-title", "Starboy - The Weeknd"] in mpv_cmds
+
+
+def test_clean_and_garbage_title_helpers():
+    """Verify _is_garbage_title and _clean_title helper behaviors."""
+    from myx.player import _clean_title, _is_garbage_title
+
+    assert _is_garbage_title("web") is True
+    assert _is_garbage_title("videoplayback") is True
+    assert _is_garbage_title("videoplayback?expire=12345&sparams=678") is True
+    assert _is_garbage_title("https://rr1---sn.googlevideo.com/videoplayback") is True
+    assert _is_garbage_title(None) is True
+    assert _is_garbage_title("") is True
+    assert _is_garbage_title("Save Your Tears") is False
+
+    assert _clean_title({"title": "web"}) is None
+    assert _clean_title({"title": "Save Your Tears", "artist": "The Weeknd"}) == "Save Your Tears - The Weeknd"
+    assert _clean_title({"title": "The Weeknd - Save Your Tears", "artist": "The Weeknd"}) == "The Weeknd - Save Your Tears"
+

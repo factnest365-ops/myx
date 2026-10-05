@@ -37,6 +37,34 @@ def _url(video_id: str) -> str:
     return f"https://www.youtube.com/watch?v={video_id}"
 
 
+def _is_garbage_title(title: str | None) -> bool:
+    if not title or not str(title).strip():
+        return True
+    s = str(title).strip().lower()
+    if s in ("web", "videoplayback", "audio", "none", "unknown"):
+        return True
+    if s.startswith(("http://", "https://", "videoplayback?")):
+        return True
+    if "videoplayback" in s and ("expire=" in s or "sparams=" in s or "id=" in s):
+        return True
+    return False
+
+
+def _clean_title(track: dict[str, Any] | None) -> str | None:
+    if not isinstance(track, dict):
+        return None
+    raw_title = track.get("title")
+    if _is_garbage_title(raw_title):
+        return None
+    title = str(raw_title).strip()
+    artist = track.get("artist")
+    if artist and isinstance(artist, str):
+        artist_clean = artist.strip()
+        if artist_clean and artist_clean.lower() not in title.lower():
+            return f"{title} - {artist_clean}"
+    return title
+
+
 _ORIGINAL_MIX_CHAIN = getattr(sources, "mix_chain", None)
 
 
@@ -314,7 +342,14 @@ class PlayerDaemon:
         self._mpv(["loadfile", stream, "replace"])
         self._id_by_path[stream] = video_id
         self.seen.add(video_id)
-        meta = self._queue_meta_cache.get(video_id, {})
+        meta = self._queue_meta_cache.get(video_id)
+        if not meta or not meta.get("title"):
+            try:
+                meta = sources.meta(video_id)
+                self._queue_meta_cache[video_id] = meta
+            except (sources.SourcesError, Exception):
+                meta = meta or {}
+        self._current_meta = meta
         self.current_track = {
             "id": video_id,
             "title": meta.get("title"),
@@ -323,6 +358,12 @@ class PlayerDaemon:
             "thumb": meta.get("thumb"),
             "stream_url": stream,
         }
+        clean_display_title = _clean_title(self.current_track)
+        if clean_display_title:
+            try:
+                self._mpv(["set_property", "force-media-title", clean_display_title])
+            except Exception:
+                pass
         self._trigger_buffer()
 
     def _trigger_buffer(self) -> None:
@@ -386,14 +427,21 @@ class PlayerDaemon:
                 item = playlist[pos]
                 path = item.get("filename")
                 vid = self._id_by_path.get(path or "") or _video_id(path)
+                cached = self._queue_meta_cache.get(vid, {}) if vid else {}
                 self.current_track = {
                     "id": vid,
-                    "title": item.get("title"),
-                    "artist": None,
-                    "duration": item.get("duration"),
-                    "thumb": None,
+                    "title": item.get("title") or cached.get("title"),
+                    "artist": cached.get("artist"),
+                    "duration": item.get("duration") or cached.get("duration"),
+                    "thumb": cached.get("thumb"),
                     "stream_url": path,
                 }
+            clean_display_title = _clean_title(self.current_track)
+            if clean_display_title:
+                try:
+                    self._mpv(["set_property", "force-media-title", clean_display_title])
+                except Exception:
+                    pass
             for _ in range(pos):
                 try:
                     self._mpv(["playlist-remove", 0])
@@ -415,6 +463,9 @@ class PlayerDaemon:
                     self._mpv(["loadfile", stream, "replace"])
                     self._id_by_path[stream] = vid
                     self.seen.add(vid)
+                    clean_display_title = _clean_title(self.current_track)
+                    if clean_display_title:
+                        self._mpv(["set_property", "force-media-title", clean_display_title])
                 except Exception:
                     pass
 
@@ -666,35 +717,98 @@ class PlayerDaemon:
         cached_thumb = self._resolve_thumb(vid, raw_thumb)
 
         queue = []
-        for item in self.queue:
-            item_id = item.get("id")
-            cached_meta = self._queue_meta_cache.get(item_id, {}) if item_id else {}
-            item_title = item.get("title") or cached_meta.get("title")
-            item_artist = item.get("artist") or cached_meta.get("artist")
-            if not isinstance(item_artist, str):
-                item_artist = None
-            item_duration = item.get("duration") or cached_meta.get("duration")
-            item_raw_thumb = item.get("thumb") or cached_meta.get("thumb")
-            item_thumb = self._resolve_thumb(item_id, item_raw_thumb)
-            queue.append(
-                {
-                    "id": item_id,
-                    "title": item_title,
-                    "artist": item_artist,
-                    "duration": item_duration,
-                    "thumb": item_thumb,
-                }
-            )
-        title_val = (
-            self._mpv(["get_property", "media-title"])
-            or (self.current_track.get("title") if self.current_track else None)
-            or current.get("title")
+        if self.queue:
+            for item in self.queue:
+                item_id = item.get("id")
+                cached_meta = self._queue_meta_cache.get(item_id, {}) if item_id else {}
+                item_title = item.get("title") or cached_meta.get("title")
+                item_artist = item.get("artist") or cached_meta.get("artist")
+                if not isinstance(item_artist, str):
+                    item_artist = None
+                item_duration = item.get("duration") or cached_meta.get("duration")
+                item_raw_thumb = item.get("thumb") or cached_meta.get("thumb")
+                item_thumb = self._resolve_thumb(item_id, item_raw_thumb)
+                queue.append(
+                    {
+                        "id": item_id,
+                        "title": item_title,
+                        "artist": item_artist,
+                        "duration": item_duration,
+                        "thumb": item_thumb,
+                    }
+                )
+        elif playlist and pos + 1 < len(playlist):
+            for item in playlist[pos + 1 :]:
+                item_id = self._id_by_path.get(item.get("filename") or "") or _video_id(
+                    item.get("filename")
+                )
+                cached_meta = self._queue_meta_cache.get(item_id, {}) if item_id else {}
+                item_title = item.get("title") or cached_meta.get("title")
+                item_artist = (
+                    item.get("uploader")
+                    if isinstance(item.get("uploader"), str)
+                    else cached_meta.get("artist")
+                )
+                if not isinstance(item_artist, str):
+                    item_artist = None
+                item_duration = item.get("duration") or cached_meta.get("duration")
+                item_raw_thumb = (
+                    item.get("thumbnail")
+                    if isinstance(item.get("thumbnail"), str)
+                    else cached_meta.get("thumb")
+                )
+                item_thumb = self._resolve_thumb(item_id, item_raw_thumb)
+                queue.append(
+                    {
+                        "id": item_id,
+                        "title": item_title,
+                        "artist": item_artist,
+                        "duration": item_duration,
+                        "thumb": item_thumb,
+                    }
+                )
+        mpv_title = self._mpv(["get_property", "media-title"])
+        cached_current = (
+            self._current_meta
+            if self._current_meta.get("id") == vid or (self._current_meta and not vid)
+            else self._queue_meta_cache.get(vid, {})
         )
-        artist_val = (self.current_track.get("artist") if self.current_track else None) or (
-            current.get("uploader") if isinstance(current.get("uploader"), str) else None
+        cur_title = (
+            (self.current_track.get("title") if self.current_track else None)
+            or cached_current.get("title")
         )
-        dur_val = self._mpv(["get_property", "duration"]) or (
-            self.current_track.get("duration") if self.current_track else None
+
+        # Never let mpv's raw 'web' or 'videoplayback' title overwrite a real title.
+        # Prioritize self.current_track.get("title")
+        if cur_title and not _is_garbage_title(cur_title):
+            title_val = cur_title
+        elif mpv_title and not _is_garbage_title(mpv_title):
+            title_val = mpv_title
+            if self.current_track and not self.current_track.get("title"):
+                self.current_track["title"] = mpv_title
+        elif current.get("title") and not _is_garbage_title(current.get("title")):
+            title_val = current.get("title")
+        else:
+            title_val = cur_title if (cur_title and not _is_garbage_title(cur_title)) else None
+
+        # Keep mpv's force-media-title in sync so macOS MediaRemote shows the clean title
+        if self.current_track:
+            clean_display_title = _clean_title(self.current_track)
+            if clean_display_title and (not mpv_title or _is_garbage_title(mpv_title)):
+                try:
+                    self._mpv(["set_property", "force-media-title", clean_display_title])
+                except Exception:
+                    pass
+
+        artist_val = (
+            (self.current_track.get("artist") if self.current_track else None)
+            or cached_current.get("artist")
+            or (current.get("uploader") if isinstance(current.get("uploader"), str) else None)
+        )
+        dur_val = (
+            self._mpv(["get_property", "duration"])
+            or (self.current_track.get("duration") if self.current_track else None)
+            or cached_current.get("duration")
         )
         pos_val = self._mpv(["get_property", "time-pos"])
         vol_val = self._mpv(["get_property", "volume"])
@@ -750,6 +864,12 @@ class PlayerDaemon:
                         self._mpv(["loadfile", stream, "replace"])
                         self._id_by_path[stream] = vid
                         self.seen.add(vid)
+                        clean_display_title = _clean_title(self.current_track)
+                        if clean_display_title:
+                            try:
+                                self._mpv(["set_property", "force-media-title", clean_display_title])
+                            except Exception:
+                                pass
                         self._trigger_buffer()
                 else:
                     self._mpv(["playlist-next", "force"])
@@ -888,6 +1008,12 @@ class PlayerDaemon:
                     self._mpv(["loadfile", stream, "replace"])
                     self._id_by_path[stream] = vid
                     self.seen.add(vid)
+                    clean_display_title = _clean_title(self.current_track)
+                    if clean_display_title:
+                        try:
+                            self._mpv(["set_property", "force-media-title", clean_display_title])
+                        except Exception:
+                            pass
                     self._trigger_buffer()
                 return {"ok": True}
             elif cmd == "quit":
