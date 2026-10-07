@@ -50,3 +50,75 @@
 ## Audit Round 2 (2026-09-28)
 
 BUG-004..BUG-022 were audited with focused hermetic regression tests; BUG-008 was disproved and dropped, while the remaining confirmed findings were fixed. Spectrum wiring (BUG-005/006) also fixed peak-hold initialization.
+
+## Audit Round 3 — For You launch surface (2026-10-07)
+
+Scope: make `myx` openable by someone who does not know YouTube URLs or the
+keybinds. Non-negotiable rule from the captain: **nothing may look clickable and
+not be.**
+
+### Findings
+
+| ID | Severity | Symptom | Reproduction | Root Cause | Fix | Test |
+|----|----------|---------|--------------|------------|-----|------|
+| BUG-023 | P1 | Search was a bottom overlay summoned by `/`; the app opened on an empty now-playing panel | `myx` with no arguments | There was no launch surface; search was a modal over the player | `myx` with no seed and no `--search` opens the For You home screen; the search bar is drawn on every frame with explicit focus state | `test_bare_myx_opens_for_you`, `test_home_shows_the_search_bar_on_every_frame` |
+| BUG-024 | P1 | Terminal input was keyboard-only, so every control needed a memorised key | Any mouse movement in the TUI | No mouse reporting, no hit regions | SGR (1006) decoding, a per-frame `InteractiveMap`, wheel scroll and drag-to-seek | `test_mouse.py`, `test_clicking_a_station_card_sends_search`, `test_drag_leaving_the_bar_still_seeks` |
+| BUG-025 | P0 | Cards were keyed by bare track id, so a favourited track in two shelves had one copy silently unclickable | Favourite a track, open For You, click its Liked card | `card_rects` keyed by `track.id`; the later shelf overwrote the earlier rect | Keys are shelf-qualified (`card:{shelf}/{track}`) | `test_card_appearing_in_two_shelves_stays_clickable_in_both` |
+| BUG-026 | P0 | Shelves that did not fit the row budget vanished with no indication; stations rendered zero cards at 100x30 | For You at 100x30 | `draw_home` broke out of the loop when rows ran out | Dropped shelves are reported on `HomeView.dropped_shelf_ids` and reachable by scrolling | `test_every_shelf_is_reachable_by_scrolling`, `test_dropped_shelves_are_reported` |
+| BUG-027 | P1 | The chevron on a shelf header fired a no-op command | Click any section header | Chevron was drawn with a placeholder `noop` action | It opens that shelf, so the affordance means what it looks like | `test_clicking_the_chevron_opens_the_shelf` |
+| BUG-028 | P1 | Controls acted on mouse *release*, so dragging off a control cancelled the click | Press and drag off a card | `handle_mouse` deferred the action to `RELEASE` | Actions fire on `PRESS`; release only ends the gesture | `test_clicking_a_station_card_sends_search` |
+| BUG-029 | P2 | A click past the right edge of the progress bar did nothing | Click the right end of the seek bar on a wide terminal | Hit test required the point to be inside the rect | The seek bar accepts a press anywhere on its row and clamps to the end | `test_seek_fraction_is_clamped` |
+| BUG-030 | P2 | `artist_key()` split collaborations on a bare case-insensitive `xX`, truncating ordinary names (`Artist` -> `art`, `Max` -> `ma`) | Any artist name containing `x` or `X` | Regex alternation had no word boundary | The `x` marker requires surrounding spaces | `test_artist_key_does_not_truncate_ordinary_names` |
+| BUG-031 | P1 | A bare library always fell back to a page containing only the stations row, so the cold-start screen could never show | First run, For You | `for_you_shelves` always appended the stations shelf | Returns `[]` with no history and no favourites, so cold start wins | `test_for_you_returns_nothing_for_a_bare_library` |
+| BUG-032 | P2 | The trailing `type to search` hint overwrote the placeholder on a narrow terminal, rendering `Search songs,type to searchl` | For You at 40 columns | Hint drawn without reserving its columns | Hint width is reserved before the field text is sized, and dropped if it cannot fit | `test_search_bar_hint_never_overwrites_the_placeholder` |
+| BUG-033 | P2 | "Your artists" rendered `The xx` as `The Xx` | For You with history | Labels built with `.title()` on the normalised key | Shelves carry the artist's own capitalisation; the key stays an id | `test_artist_shelf_keeps_the_artists_own_capitalisation` |
+
+### Design system
+
+Screens no longer invent padding. `myx/design.py` owns a cell rhythm
+(`space()`), semantic type roles (`Role`/`TypeScale`), and breakpoints
+(`for_size()`, `Metrics`). Rows are an independent axis from width, so a
+200x8 window classifies as wide *and* short rather than being mistaken for a
+small one. `myx/ansi.py` holds the ANSI and display-width primitives shared by
+the renderer and the surface.
+
+### The no-dead-affordances rule
+
+Enforced structurally rather than by convention: `SurfaceDrawer._element()` is
+the only way to draw something interactive and refuses to register a region
+with no action or no area. `InteractiveMap.dead_affordances()` reports anything
+registered but inert, and `missing_keyboard_parity()` reports controls
+reachable only by mouse. The home frame asserts both are empty at 40, 60, 120
+and 80x12.
+
+### Usability Changes (what users will notice)
+
+- `myx` with no arguments opens For You: shelves seeded from listening history,
+  one-tap genre stations, favourites, and a persistent search bar
+- Search is a real field with focus state; typing anywhere focuses it
+- Mouse works: clicks, wheel scroll, drag-to-seek, and reporting is turned on at
+  start and off at exit so no terminal is left in a reporting state
+- Every visible control is clickable *and* keyboard-reachable
+
+### Known Remaining Issues
+
+- `myx/design.py` is currently used by the For You surface; the older
+  now/lyrics/queue views still carry their own hand-rolled padding. Migrating
+  them is follow-up work, not a regression.
+- The home screen shows a fixed window of shelves; there is no paging UI beyond
+  scroll, so a very short terminal still needs scrolling to reach the last shelf
+  (reported on screen as `▼ N more — scroll`).
+- `ansi.py` duplicates the colour/width helpers that `tui.py` still defines.
+  `tui.py` was left untouched to keep this change surgical; the duplication
+  should collapse once the older views move to the shared module.
+- The four ruff `F401` findings in `tests/test_jit_queue.py` and
+  `tests/test_mcp_fast.py` predate this work and are outside its scope. Every
+  file added or changed here is ruff-clean under `--select E9,F`.
+
+### Verification
+
+331 tests pass: the 120 pre-existing ones plus 211 added across
+`test_design.py`, `test_mouse.py`, `test_library.py`, `test_surface.py`, and
+`test_wireup.py`. The Round 2 regression tests for JSON-RPC conformance,
+daemon lifecycle, CJK/emoji cell widths, spectrum wiring, and non-blocking
+ffmpeg taps all still pass.
