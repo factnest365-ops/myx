@@ -72,6 +72,16 @@ not be.**
 | BUG-031 | P1 | A bare library always fell back to a page containing only the stations row, so the cold-start screen could never show | First run, For You | `for_you_shelves` always appended the stations shelf | Returns `[]` with no history and no favourites, so cold start wins | `test_for_you_returns_nothing_for_a_bare_library` |
 | BUG-032 | P2 | The trailing `type to search` hint overwrote the placeholder on a narrow terminal, rendering `Search songs,type to searchl` | For You at 40 columns | Hint drawn without reserving its columns | Hint width is reserved before the field text is sized, and dropped if it cannot fit | `test_search_bar_hint_never_overwrites_the_placeholder` |
 | BUG-033 | P2 | "Your artists" rendered `The xx` as `The Xx` | For You with history | Labels built with `.title()` on the normalised key | Shelves carry the artist's own capitalisation; the key stays an id | `test_artist_shelf_keeps_the_artists_own_capitalisation` |
+| BUG-034 | P0 | The now-playing progress bar was drawn but never registered, so clicking it did nothing — a dead affordance shipped despite BUG-029 claiming it fixed | Now Playing, click the progress bar | `handle_mouse` looked up `seek:main`, but nothing ever added that region; the seek tests registered one by hand and so never caught it | The bar registers itself where it is drawn, against a real seek action | `test_now_playing_registers_the_seek_bar`, `test_clicking_the_real_seek_bar_seeks`, `test_dragging_the_real_seek_bar_seeks` |
+| BUG-035 | P0 | Submitting a search from For You did nothing visible: the query landed in the bar and the screen looked inert | Type in the search bar, press Enter | `_submit_search` set `overlay="search"` but stayed on the home surface, whose `render_once` branch returns before overlays are composited | Submitting leaves the home surface for the player layout, where the results picker is drawn | `test_submitted_search_results_are_actually_visible`, `test_submit_leaves_the_home_surface` |
+
+> BUG-034 and BUG-035 were found *after* the first pass reported itself done,
+> by re-running the acceptance criteria against the real rendered screen rather
+> than against the unit tests. BUG-029 had been recorded as fixed when the code
+> path it described was unreachable; BUG-035 was a defect the test suite could
+> not see because it asserted on state rather than on what was drawn. Both are
+> recorded here because the lesson is the point: a green suite is not evidence
+> that a control is reachable, only evidence that the tests reach it.
 
 ### Design system
 
@@ -117,8 +127,13 @@ and 80x12.
 
 ### Verification
 
-331 tests pass: the 120 pre-existing ones plus 211 added across
-`test_design.py`, `test_mouse.py`, `test_library.py`, `test_surface.py`, and
-`test_wireup.py`. The Round 2 regression tests for JSON-RPC conformance,
-daemon lifecycle, CJK/emoji cell widths, spectrum wiring, and non-blocking
-ffmpeg taps all still pass.
+343 tests pass: the 120 pre-existing ones plus 223 added across
+`test_design.py`, `test_mouse.py`, `test_library.py`, `test_surface.py`,
+`test_wireup.py`, and `test_tty_mouse.py`. The Round 2 regression tests for
+JSON-RPC conformance, daemon lifecycle, CJK/emoji cell widths, spectrum wiring,
+and non-blocking ffmpeg taps all still pass.
+
+The mouse-reporting lifecycle is verified by `test_tty_mouse.py`, which drives
+`tui.run()` through a real PTY and inspects the bytes it writes. Asserting on the
+`ENABLE_MOUSE`/`DISABLE_MOUSE` constants would only prove the constants exist;
+that lifecycle is gated on `isatty()` and cannot be observed any other way.

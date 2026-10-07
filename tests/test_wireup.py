@@ -245,6 +245,90 @@ def test_drag_over_a_seek_bar_seeks(monkeypatch):
     assert jumps[-1][1]["value"] > jumps[0][1]["value"]
 
 
+def playing_state() -> dict:
+    return {
+        "playing": True,
+        "title": "Song",
+        "artist": "A",
+        "id": "x",
+        "duration": 228,
+        "position": 57,
+        "queue": [],
+    }
+
+
+def test_now_playing_registers_the_seek_bar():
+    """The progress bar looks like a control, so it must be one.
+
+    It was drawn but never registered, so clicking it did nothing — the exact
+    dead affordance the launch brief forbids. Its tests had been registering a
+    region by hand, which hid the gap.
+    """
+    r = tui.Renderer(out=io.StringIO())
+    r.show_home = False
+    r.view = "now"
+    r.render_once(state=playing_state(), size=(100, 30))
+    reg = r.interactive.get("seek:main")
+    assert reg is not None, "the rendered progress bar must be clickable"
+    assert reg.actionable, "a registered bar must have an action behind it"
+    assert reg.rect.w > 1 and reg.rect.h == 1
+
+
+def test_now_playing_seek_bar_is_not_a_dead_affordance():
+    r = tui.Renderer(out=io.StringIO())
+    r.show_home = False
+    r.view = "now"
+    r.render_once(state=playing_state(), size=(100, 30))
+    assert r.dead_affordances() == []
+
+
+def test_clicking_the_real_seek_bar_seeks(monkeypatch):
+    calls: list = []
+    monkeypatch.setattr(tui, "send_command", lambda cmd, **kw: calls.append((cmd, kw)))
+    r = tui.Renderer(out=io.StringIO())
+    r.show_home = False
+    r.view = "now"
+    r.render_once(state=playing_state(), size=(100, 30))
+    reg = r.interactive.get("seek:main")
+    assert reg is not None
+    target = reg.rect.x + int(reg.rect.w * 0.75)
+    r.handle_mouse(press(target, reg.rect.y))
+    jumps = [c for c in calls if c[0] == "jump"]
+    assert jumps, "clicking the rendered bar must seek"
+    assert abs(jumps[-1][1]["value"] - 0.75) < 0.05, jumps[-1]
+
+
+def test_dragging_the_real_seek_bar_seeks(monkeypatch):
+    calls: list = []
+    monkeypatch.setattr(tui, "send_command", lambda cmd, **kw: calls.append((cmd, kw)))
+    r = tui.Renderer(out=io.StringIO())
+    r.show_home = False
+    r.view = "now"
+    r.render_once(state=playing_state(), size=(100, 30))
+    reg = r.interactive.get("seek:main")
+    assert reg is not None
+    start = reg.rect.x + int(reg.rect.w * 0.8)
+    r.handle_mouse(press(start, reg.rect.y))
+    calls.clear()
+    to = reg.rect.x + int(reg.rect.w * 0.25)
+    r.handle_mouse(drag(to, reg.rect.y))
+    jumps = [c for c in calls if c[0] == "jump"]
+    assert jumps, "dragging the rendered bar must seek"
+    assert abs(jumps[-1][1]["value"] - 0.25) < 0.05, jumps[-1]
+
+
+def test_seek_bar_is_absent_when_there_is_nothing_to_seek():
+    """With no duration there is no position to seek to, so no bar is offered."""
+    r = tui.Renderer(out=io.StringIO())
+    r.show_home = False
+    r.view = "now"
+    state = playing_state()
+    state["duration"] = 0
+    r.render_once(state=state, size=(100, 30))
+    assert r.interactive.get("seek:main") is None
+    assert r.dead_affordances() == []
+
+
 def test_drag_leaving_the_bar_still_seeks(monkeypatch):
     """A seek must not drop the moment the pointer leaves the bar."""
     calls: list = []
@@ -341,6 +425,44 @@ def test_submit_opens_the_search_picker(monkeypatch):
     r.handle_key("m")
     r.handle_key("\r")
     assert r.overlay == "search", "Enter submits into the results picker"
+
+
+def test_submitted_search_results_are_actually_visible(monkeypatch):
+    """Pressing Enter must show results, not leave an inert screen.
+
+    Submitting set the overlay but stayed on For You, whose render path returns
+    before overlays are composited — so the query vanished and nothing happened,
+    which is the dead-affordance failure in its worst form: the search bar looked
+    live and silently swallowed the input.
+    """
+    monkeypatch.setattr(
+        tui, "send_command", lambda cmd, **kw: {"ok": True, "queued": 3}
+    )
+    r = home_renderer()
+    r.render_once(state=EMPTY_STATE, size=(100, 30))
+    for ch in "m83":
+        r.handle_key(ch)
+    r.handle_key("\r")
+
+    frame = r.render_once(state=EMPTY_STATE, size=(100, 30))
+    plain = _ANSI_INDEP.sub("", frame)
+    assert "m83" in plain, "the submitted query must be visible on screen"
+    assert "Search" in plain, "the results picker must be on screen"
+    assert "added to queue" in plain or "results" in plain or "queued" in plain, (
+        "the user must be told what happened to their search"
+    )
+
+
+def test_submit_leaves_the_home_surface(monkeypatch):
+    monkeypatch.setattr(
+        tui, "send_command", lambda cmd, **kw: {"ok": True, "queued": 3}
+    )
+    r = home_renderer()
+    r.render_once(state=EMPTY_STATE, size=(100, 30))
+    r.handle_key("/")
+    r.handle_key("x")
+    r.handle_key("\r")
+    assert not r.show_home, "results live on the player layout, not For You"
 
 
 def test_recent_queries_appear_as_suggestions():

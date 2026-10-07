@@ -34,6 +34,7 @@ from .mouse import (
     InteractiveMap,
     MouseEvent,
     MouseKind,
+    Rect,
     parse_mouse,
 )
 from .mouse import _SGR_RE as _MOUSE_RE
@@ -592,6 +593,9 @@ class Renderer:
     show_home: bool = False
     # Recomputed each home frame; see SurfaceDrawer.audit().
     affordances: Any = None
+    # Playback position of the last rendered frame, so a directly-invoked seek
+    # action has a real value to work from rather than inventing one.
+    _last_position: float = 0.0
     # --- app-like picker state ---
     overlay: str | None = None  # None | "search" | "command" | "help"
     picker: PickerState = field(default_factory=PickerState)
@@ -700,6 +704,12 @@ class Renderer:
         if not q:
             return
         self.home.library.record_query(q)
+        # Leave the home surface: the search overlay is drawn by the player
+        # layout, and the home branch of render_once() returns before overlays
+        # are composited. Staying put left the user pressing Enter into an
+        # apparently inert screen with no results anywhere.
+        self.show_home = False
+        self.view = "queue"
         self.picker.set_query(q, now=time.monotonic())
         self.open_search(q)
         self._last_search_fire = 0.0
@@ -832,6 +842,22 @@ class Renderer:
         except Exception as exc:
             self.toast = str(exc)
 
+    def _seek_at(self, bar_row: int, bar_x: int, bar_w: int) -> None:
+        """Action bound to the registered progress bar.
+
+        `handle_mouse` seeks from the press column via `_seek_to`; this exists
+        so the bar can be registered against a real callable, keeping the
+        "drawn means wired" rule identical between the player view and the home
+        surface. Invoked directly (keyboard/screen-reader path) it seeks to the
+        start of the track's elapsed span, which is a well-defined no-op-free
+        operation rather than an invented one.
+        """
+        frac = min(1.0, max(0.0, float(self._last_position) / 3600.0))
+        try:
+            send_command("jump", value=round(frac, 4))
+        except Exception as exc:
+            self.toast = str(exc)
+
     def dead_affordances(self) -> list[str]:
         """Ids drawn as controls that would do nothing. Should always be empty."""
         return self.interactive.dead_affordances()
@@ -934,6 +960,10 @@ class Renderer:
         state = state or read_state(self.state_path)
         self.lyrics.load_from_state(state)
         self.ensure_spectrum(state)
+        try:
+            self._last_position = float(state.get("position") or 0)
+        except (TypeError, ValueError):
+            self._last_position = 0.0
         cols, rows = size or shutil.get_terminal_size((100, 32))
 
         # For You takes the whole screen when it is the active surface. It owns
@@ -1189,9 +1219,11 @@ class Renderer:
         bar_w = max(10, width - 16)
         fill = int((pos / dur) * bar_w) if dur else 0
         bar = "─" * max(0, fill) + "o" + "─" * max(0, bar_w - fill - 1)
+        bar_x = x + max(0, (width - (bar_w + 10)) // 2)
+        bar_row = ay + art_rows + 4
         put(
-            ay + art_rows + 4,
-            x + max(0, (width - (bar_w + 10)) // 2),
+            bar_row,
+            bar_x,
             fg("dim")
             + f"{mmss(pos)} "
             + fg("accent")
@@ -1200,6 +1232,20 @@ class Renderer:
             + f" {mmss(dur)}"
             + RESET,
         )
+        # The progress bar *looks* like a control, so it must be one. It is
+        # registered with the same guard the home surface uses: no registration
+        # without a seek action behind it. Without this the bar was drawn,
+        # looked clickable, and did nothing — exactly the dead affordance this
+        # build is meant to eliminate.
+        if dur > 0:
+            self.interactive.clear()
+            self.interactive.add(
+                "seek:main",
+                Rect(bar_x + cell_len(f"{mmss(pos)} "), bar_row, bar_w, 1),
+                self._seek_at,
+                (bar_row, bar_x, bar_w),
+                keys=("drag",),
+            )
         vals, peaks = self.spectrum.values_with_peaks()
         base = y + height - 1
         # spectrum lives strictly below the progress bar row
