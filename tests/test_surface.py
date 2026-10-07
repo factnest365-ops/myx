@@ -9,7 +9,7 @@ from typing import Any
 
 from myx.ansi import cell_len, strip_ansi
 from myx.design import metrics
-from myx.library import Library
+from myx.library import Library, home_shelves
 from myx.mouse import InteractiveMap, MouseButton, MouseEvent, MouseKind
 from myx.surface import (
     CHEVRON,
@@ -262,6 +262,56 @@ def test_suggestions_are_each_clickable():
     assert "suggestion.1" in drawer.interactive
     drawer.click(m.gutter + 1, 3)
     assert rec.named("pick_suggestion")[0].text == "miles davis"
+
+
+def test_search_bar_hint_never_overwrites_the_placeholder():
+    """A narrow terminal used to render garbled bar text.
+
+    The trailing hint was drawn without reserving its columns first, so at 40
+    columns it landed on top of the placeholder: "Search songs,type to searchl".
+    """
+    for cols in (40, 48, 60, 80, 100, 120):
+        rec = Recorder()
+        drawer = SurfaceDrawer(make_actions(rec))
+        grid, put, _ = make_canvas(cols, 24)
+        m = metrics(cols, 24)
+        drawer.draw_search_bar(put, SearchBar(), m, 0)
+        row = "".join(grid[0])
+        assert len(row) == cols
+
+        hint_at = row.rfind("type to search")
+        if hint_at < 0:
+            # Narrower than the hint needs: it must be omitted, not half-drawn.
+            assert "type to" not in row, f"partially drawn hint at {cols} cols"
+            continue
+        # Everything before the hint is the field: a cropped placeholder, which
+        # is correct. The hint must not bleed backwards into it.
+        before = row[:hint_at].rstrip()
+        assert "type to search" not in before, f"hint bled left at {cols} cols"
+        assert before.strip().startswith("▌"), before
+        assert "Search" in before, before
+
+
+def test_search_bar_hint_is_dropped_when_it_cannot_fit():
+    """At the narrowest size the hint is omitted rather than overlapping."""
+    rec = Recorder()
+    drawer = SurfaceDrawer(make_actions(rec))
+    grid, put, _ = make_canvas(40, 24)
+    drawer.draw_search_bar(put, SearchBar(), metrics(40, 24), 0)
+    row = "".join(grid[0]).rstrip()
+    assert row.isprintable()
+    assert len(grid[0]) == 40
+
+
+def test_artist_shelf_keeps_the_artists_own_capitalisation():
+    """Normalised keys must not leak into the UI as display text."""
+    liby = Library()
+    liby.record_play("x1", "Intro", "The xx", now=NOW)
+    liby.record_play("x2", "River", "Bon Iver", now=NOW - 10)
+    shelves = {s.id: s for s in home_shelves(liby, now=NOW)}
+    titles = {t.title for t in shelves["artists"].tracks}
+    assert "The xx" in titles, f"artist casing was mangled: {titles}"
+    assert "Bon Iver" in titles
 
 
 def test_no_suggestions_draws_nothing():

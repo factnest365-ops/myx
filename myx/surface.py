@@ -269,8 +269,13 @@ class SurfaceDrawer:
         """The always-present top search field, with real focus semantics."""
         x = m.gutter
         width = m.content_width
-        # Reserve room for the focus edge, the icon, and the trailing hint.
-        inner_w = max(1, width - 4)
+        hint = "↵ search" if bar.focused else "type to search"
+        # Reserve the hint's columns before sizing the field text. Drawing the
+        # hint without reserving space let it overwrite the placeholder on a
+        # narrow terminal, producing garbled text like "Search songs,type to…".
+        hint_w = cell_len(hint) + 2 if cell_len(hint) + 2 <= width else 0
+        # Reserve the focus edge and the icon, plus the hint if it is shown.
+        inner_w = max(1, width - 4 - hint_w)
         bar.max_visible = max(1, inner_w - 2)
 
         icon = CURSOR_BLOCK if bar.focused else SEARCH_ICON
@@ -289,8 +294,7 @@ class SurfaceDrawer:
         )
         put(row, x, pad(line, width))
 
-        hint = "↵ search" if bar.focused else "type to search"
-        if cell_len(hint) <= width - 4:
+        if hint_w:
             put(
                 row,
                 x + width - cell_len(hint) - 1,

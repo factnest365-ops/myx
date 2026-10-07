@@ -314,11 +314,25 @@ def _reason(entry: HistoryEntry, now: float) -> str:
 
 def recently_played_artists(history: Iterable[HistoryEntry], count: int = 3) -> list[str]:
     """Distinct artist keys from the most recent plays, most recent first."""
-    out: list[str] = []
+    return [artist_key(name) for name, _ in recently_played_artist_names(history, count)]
+
+
+def recently_played_artist_names(
+    history: Iterable[HistoryEntry], count: int = 3
+) -> list[tuple[str, str]]:
+    """(normalised key, display name) for the most recent distinct artists.
+
+    The display name keeps the artist's own capitalisation: normalising to a
+    key and then title-casing it for the UI turns "The xx" into "The Xx".
+    """
+    seen: set[str] = set()
+    out: list[tuple[str, str]] = []
     for entry in sorted(history, key=lambda e: e.last_played, reverse=True):
         key = artist_key(entry.artist)
-        if key and key not in out:
-            out.append(key)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append((key, str(entry.artist).strip()))
         if len(out) >= count:
             break
     return out
@@ -389,8 +403,8 @@ def for_you_shelves(library: Library, now: float | None = None, limit: int = 12)
         )
 
     # Artists we keep hearing, as one-tap entries.
-    artists = recently_played_artists(library.history, 4)
-    if artists:
+    artist_names = recently_played_artist_names(library.history, 4)
+    if artist_names:
         shelves.append(
             Shelf(
                 "artists",
@@ -398,14 +412,14 @@ def for_you_shelves(library: Library, now: float | None = None, limit: int = 12)
                 "tap to open",
                 [
                     Track(
-                        id=f"artist:{a}",
-                        title=a.title(),
+                        id=f"artist:{key}",
+                        title=display,
                         artist="",
                         kind="artist",
-                        query=a,
+                        query=display,
                         action="open_artist",
                     )
-                    for a in artists
+                    for key, display in artist_names
                 ],
             )
         )
