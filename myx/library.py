@@ -222,21 +222,31 @@ class Library:
             return cls()
         history: list[HistoryEntry] = []
         seen: set[str] = set()
-        for item in raw.get("history") or []:
+        # A hand-edited or half-written file can put a non-list where a list
+        # belongs. `load` promises to fall back to empty on any problem, so
+        # every read here is type-checked rather than assumed.
+        raw_history = raw.get("history")
+        for item in raw_history if isinstance(raw_history, list) else []:
             if not isinstance(item, dict):
                 continue
             entry = HistoryEntry.from_dict(item)
             if entry is not None and entry.id not in seen:
                 seen.add(entry.id)
                 history.append(entry)
+        raw_favs = raw.get("favourites")
         favourites = [
             str(v)
-            for v in (raw.get("favourites") or [])
+            for v in (raw_favs if isinstance(raw_favs, list) else [])
             if isinstance(v, (str, int)) and str(v).strip()
         ]
         # Preserve order, drop duplicates.
         uniq_favs = list(dict.fromkeys(favourites))
-        queries = [str(q).strip() for q in (raw.get("recent_queries") or []) if str(q).strip()]
+        raw_queries = raw.get("recent_queries")
+        queries = [
+            str(q).strip()
+            for q in (raw_queries if isinstance(raw_queries, list) else [])
+            if isinstance(q, (str, int)) and str(q).strip()
+        ]
         return cls(
             history=history[:HISTORY_LIMIT],
             favourites=uniq_favs,

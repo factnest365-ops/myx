@@ -193,3 +193,27 @@ imply a rationale that was never true.
   that one site back to `except Exception` makes it fail with
   "RuntimeError was swallowed; the catch is too broad". It fails when the fix
   is undone, which is the only thing that makes it worth having.
+
+### BUG-038 (found while re-verifying Round 4) — corrupt library crashed `myx` at launch
+
+Round 4's narrowing was re-checked by reading every statement inside the six
+try blocks rather than assuming. Tracing `Library.from_dict` turned up a
+separate, pre-existing-in-this-branch defect that the narrowed catches had made
+worth looking for.
+
+| ID | Severity | Symptom | Reproduction | Root Cause | Fix | Test |
+|----|----------|---------|--------------|------------|-----|------|
+| BUG-038 | P0 | A hand-edited or half-written `library.json` made `myx` exit with `TypeError` before the first frame was drawn — the For You home screen never opened | Write `{"version":1,"recent_queries":3}` to the library file, then launch `myx` | `from_dict` read `raw.get("recent_queries") or []` and iterated the result. A non-list value (`3`) is truthy, so `or []` never replaced it and `for q in 3` raised. `Renderer.load_library()` is called unguarded at startup | Each of the three collection reads is now type-checked with `isinstance(..., list)` before iteration, matching the guard `history` already had. Scalar reads (`plays`, `last_played`) were already inside `try` | `test_malformed_library_does_not_crash_launch`, `test_library_load_never_raises_on_malformed_input` |
+
+`Library.load`'s docstring already promised to "fall back to empty on any
+problem"; `from_dict` sat outside its `try`, so the promise was not kept. The
+fix restores it rather than widening a catch.
+
+#### Why the re-check mattered
+
+The narrowing itself is sound: `send_command` raises only `OSError` and
+`ValueError`, and every other statement inside the six try blocks was verified
+to be safe. `record_play`'s `history.sort(key=lambda e: e.last_played)` looked
+like a `TypeError` risk for mixed-type keys, but `HistoryEntry.from_dict`
+coerces `last_played` to `float` in a `try`, so the sort key is always a float.
+That one is genuinely unreachable. The `from_dict` list reads were not.
