@@ -12,7 +12,6 @@ from an empty state and 'q' exits before any command matters.
 
 import os
 import pty
-
 import sys
 import time
 from pathlib import Path
@@ -34,7 +33,7 @@ def _run_pty(feed: bytes = b"q", timeout: float = 20.0) -> tuple[int, str, str]:
         try:
             os.chdir(REPO)
             os.execve(sys.executable, [sys.executable, "-c", code], env)
-        except Exception:  # pragma: no cover - child failure path
+        except OSError:  # pragma: no cover - child failure path
             os._exit(127)
 
     chunks: list[bytes] = []
@@ -80,7 +79,7 @@ def _run_pty(feed: bytes = b"q", timeout: float = 20.0) -> tuple[int, str, str]:
 
 def test_run_enables_mouse_reporting_on_start_over_a_real_tty():
     """A TTY session must turn mouse reporting on."""
-    rc, out, _ = _run_pty()
+    _rc, out, _ = _run_pty()
     assert "\x1b[?1000h" in out, "mouse reporting (1000) not enabled on start"
     assert "\x1b[?1002h" in out, "drag tracking (1002) not enabled on start"
     assert "\x1b[?1006h" in out, "SGR coordinates (1006) not enabled on start"
@@ -97,7 +96,7 @@ def test_run_disables_mouse_reporting_on_exit_over_a_real_tty():
 
 def test_enable_comes_before_disable_on_a_real_tty():
     """Ordering matters: reporting is on at start, off at exit, never inverted."""
-    rc, out, _ = _run_pty()
+    _rc, out, _ = _run_pty()
     on_1000 = out.find("\x1b[?1000h")
     off_1000 = out.find("\x1b[?1000l")
     assert on_1000 >= 0 and off_1000 >= 0
@@ -106,14 +105,14 @@ def test_enable_comes_before_disable_on_a_real_tty():
 
 def test_run_exits_the_alt_screen_on_a_real_tty():
     """Terminal state must be restored, not just mouse reporting."""
-    rc, out, _ = _run_pty()
+    _rc, out, _ = _run_pty()
     assert "\x1b[?1049h" in out, "alt screen was never entered"
     assert "\x1b[?1049l" in out, "alt screen was never left"
     assert "\x1b[?25h" in out, "cursor was never restored"
 
 
 def test_run_renders_the_home_screen_on_a_real_tty():
-    rc, out, _ = _run_pty()
+    _rc, out, _ = _run_pty()
     import re
 
     plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", out)

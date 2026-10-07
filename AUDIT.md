@@ -137,3 +137,59 @@ The mouse-reporting lifecycle is verified by `test_tty_mouse.py`, which drives
 `tui.run()` through a real PTY and inspects the bytes it writes. Asserting on the
 `ENABLE_MOUSE`/`DISABLE_MOUSE` constants would only prove the constants exist;
 that lifecycle is gated on `isatty()` and cannot be observed any other way.
+
+## Audit Round 4 — daemon error handling (2026-10-07)
+
+Scope: clear the six new `BLE001` blind-except findings this branch added to
+`myx/tui.py`, and confirm no new ruff findings anywhere in the diff.
+
+### Findings
+
+| ID | Severity | Symptom | Reproduction | Root Cause | Fix | Test |
+|----|----------|---------|--------------|------------|-----|------|
+| BUG-036 | P1 | Six code paths this branch added caught bare `Exception` around daemon calls, so any defect in the render/input path became a silent no-op on a screen that had already stopped responding | `_play_track`, `_play_station`, `_seek_to`, `_seek_at`, and two `_handle_home_key` branches | `send_command` failures were handled with `except Exception`, the same shortcut the surrounding code used | Each site now catches `DAEMON_UNREACHABLE = (OSError, ValueError)`, the complete failure surface of `send_command`: `OSError` covers connect/recv refusal and `socket.timeout`, `ValueError` covers the reply's utf-8 and JSON decode | `test_send_command_failure_surfaces_as_toast`, `test_real_bug_in_play_track_is_not_swallowed`, `test_play_station_and_seek_share_the_narrow_catch` |
+| BUG-037 | P2 | `send_command`'s failure surface was never written down, so each caller had to re-derive it by guessing | Read any handler that catches around `send_command` | No documented contract on the function | `send_command` now documents exactly which exceptions it raises and why | docstring; every handler cites it |
+
+`DAEMON_UNREACHABLE` is a named tuple rather than six repeated literals so the
+failure surface is stated once and cannot drift between call sites.
+
+### Correction to the review note that prompted this round
+
+The review attributed these six to lines 1573, 1600, 1619, 1690, 1695 and 1771,
+and described them as blind excepts that "swallow KeyboardInterrupt and
+SystemExit". Both parts were wrong, and the distinction matters:
+
+- **Wrong lines.** Blame shows the six genuinely new sites are `_play_track`,
+  `_play_station`, `_seek_to`, `_seek_at` and two `_handle_home_key` branches.
+  The lines named in the review (`_handle_search_key`, `_send_play_id`,
+  `_execute_command`) trace to `dd60424b`, which is already merged into `main`,
+  so they are pre-existing. Line numbers had drifted against a stale read of the
+  file. Mapping each handler to its enclosing function against `main` was needed
+  to tell the two apart.
+- **Wrong mechanism.** `KeyboardInterrupt` and `SystemExit` inherit from
+  `BaseException`, not `Exception`, so a bare `except Exception` never caught
+  either of them. The stated failure mode could not occur.
+
+The count was right (19 vs a baseline of 13, all six in this branch), so the
+fix stood. Only the rationale needed correcting — noted here rather than left to
+imply a rationale that was never true.
+
+### Verification
+
+- `myx/tui.py` `BLE001` is back to **13**, exactly matching `main`. All six new
+  sites cleared; the 13 pre-existing ones were left alone as out of scope.
+- Repo-wide ruff counts are now **identical to `main` per rule** (BLE001 85,
+  S110 25, PLW1510 5, PLR0402 4, F401 4, SIM103 2, and the singletons). Two
+  further new-findings classes surfaced while checking this and were also fixed:
+  1 `BLE001` in `tests/test_tty_mouse.py` (a child `os.execve` failure is
+  `OSError`) and 85 `RUF059` unused-unpacked-variables in the new
+  `test_surface.py` / `test_tty_mouse.py`, plus 1 `RUF015` single-element slice
+  in `test_wireup.py` and 2 `I001` import-order findings.
+- 346 tests pass (343 before this round, plus 3 added here). The 122 Round 2
+  regression tests for JSON-RPC conformance, daemon lifecycle, headless
+  controls, CJK/emoji cell widths, spectrum wiring, and non-blocking ffmpeg taps
+  all still pass.
+- `test_real_bug_in_play_track_is_not_swallowed` was mutation-checked: reverting
+  that one site back to `except Exception` makes it fail with
+  "RuntimeError was swallowed; the catch is too broad". It fails when the fix
+  is undone, which is the only thing that makes it worth having.

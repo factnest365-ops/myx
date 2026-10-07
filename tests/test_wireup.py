@@ -8,8 +8,10 @@ import io
 import re
 from pathlib import Path
 
+import pytest
+
 from myx import cli, tui
-from myx.library import Library
+from myx.library import Library, Track
 from myx.mouse import (
     DISABLE_MOUSE,
     ENABLE_MOUSE,
@@ -351,7 +353,7 @@ def test_seek_fraction_is_clamped(monkeypatch):
         "seek:main", Rect(0, 10, 10, 1), lambda: None, keys=("drag",)
     )
     r.handle_mouse(press(999, 10))
-    jump = [c for c in calls if c[0] == "jump"][0]
+    jump = next(c for c in calls if c[0] == "jump")
     assert 0.0 <= jump[1]["value"] <= 1.0
 
 
@@ -827,3 +829,58 @@ def test_cjk_titles_fit_at_40_columns():
     frame = r.render_once(state=EMPTY_STATE, size=(40, 24))
     for i, line in enumerate(frame.split("\n")):
         assert disp_width(line) <= 40, f"row {i} overflows at 40 cols: {line!r}"
+
+
+# ---------------------------------------------------------------------------
+# Round 4: the daemon catch must stay narrow enough to notice a real bug
+# ---------------------------------------------------------------------------
+
+
+def test_send_command_failure_surfaces_as_toast(monkeypatch):
+    """An unreachable daemon is a user-visible toast, not a crash."""
+    for boom in (OSError("daemon is not running"), ValueError("bad json reply")):
+
+        def fake(cmd, _boom=boom, **kw):
+            raise _boom
+
+        monkeypatch.setattr(tui, "send_command", fake)
+        r = home_renderer()
+        r._play_track(Track(id="t1", title="Song"))
+        assert str(boom) in r.toast, f"{boom!r} should reach the user"
+
+
+def test_real_bug_in_play_track_is_not_swallowed(monkeypatch):
+    """A defect inside the try block must propagate, not become a toast.
+
+    This is the whole point of narrowing the catch: if the bookkeeping after a
+    successful `send_command` raises, the user gets a traceback instead of a
+    silently dead card.
+    """
+    monkeypatch.setattr(tui, "send_command", lambda cmd, **kw: {"ok": True})
+    r = home_renderer()
+
+    def explode(*a, **kw):
+        raise RuntimeError("library bookkeeping bug")
+
+    monkeypatch.setattr(type(r.home.library), "record_play", explode)
+    try:
+        r._play_track(Track(id="t1", title="Song"))
+    except RuntimeError as exc:
+        assert "bookkeeping bug" in str(exc)
+    else:
+        pytest.fail("RuntimeError was swallowed; the catch is too broad")
+
+
+def test_play_station_and_seek_share_the_narrow_catch(monkeypatch):
+    """The other three new sites use the same narrow surface, not Exception."""
+    for boom in (OSError("gone"), ValueError("bad json")):
+
+        def fake(cmd, _boom=boom, **kw):
+            raise _boom
+
+        monkeypatch.setattr(tui, "send_command", fake)
+        r = home_renderer()
+        r._play_station(Track(id="s1", title="Lo-fi", kind="station", query="lofi"))
+        assert str(boom) in r.toast
+        r._seek_to(Rect(0, 10, 10, 1), 5)
+        assert str(boom) in r.toast

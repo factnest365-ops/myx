@@ -27,6 +27,7 @@ from typing import IO, Any
 
 from .design import metrics as layout_metrics
 from .library import Shelf, Track
+from .mouse import _SGR_RE as _MOUSE_RE
 from .mouse import (
     DISABLE_MOUSE,
     ENABLE_MOUSE,
@@ -37,7 +38,6 @@ from .mouse import (
     Rect,
     parse_mouse,
 )
-from .mouse import _SGR_RE as _MOUSE_RE
 from .surface import (
     HomeView,
     SearchBar,
@@ -243,6 +243,14 @@ def read_state(path: Path = STATE_PATH) -> dict[str, Any]:
 
 
 def send_command(cmd: str, **payload: Any) -> dict[str, Any]:
+    """Talk to the daemon over its unix socket.
+
+    Raises `OSError` when the daemon is absent, refuses the connection, or does
+    not answer in time (`socket.timeout` is an `OSError`), and `ValueError` when
+    the reply is not valid utf-8 or JSON. Callers catch exactly that pair, so a
+    real bug in the render path still surfaces instead of becoming a silent
+    no-op that leaves the screen frozen with nothing on screen to explain it.
+    """
     message = {"cmd": cmd, **payload}
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         sock.settimeout(1.5)
@@ -250,6 +258,12 @@ def send_command(cmd: str, **payload: Any) -> dict[str, Any]:
         sock.sendall((json.dumps(message) + "\n").encode())
         data = sock.recv(4096)
     return json.loads(data.decode() or '{"ok": true}')
+
+
+# The complete failure surface of `send_command`. Naming it keeps the TUI honest:
+# an unreachable daemon becomes a toast, while a genuine bug still propagates
+# instead of being flattened into a silent no-op on a screen that has gone dead.
+DAEMON_UNREACHABLE = (OSError, ValueError)
 
 
 @dataclass
@@ -732,7 +746,7 @@ class Renderer:
             self.show_home = False
             self.view = "now"
             self.toast = f"Playing {track.title}"
-        except Exception as exc:
+        except DAEMON_UNREACHABLE as exc:
             self.toast = str(exc)
 
     def _play_station(self, track: Track) -> None:
@@ -746,7 +760,7 @@ class Renderer:
             self.show_home = False
             self.view = "now"
             self.toast = f"Playing {track.title}"
-        except Exception as exc:
+        except DAEMON_UNREACHABLE as exc:
             self.toast = str(exc)
 
     def _open_artist(self, track: Track) -> None:
@@ -839,7 +853,7 @@ class Renderer:
         frac = min(1.0, max(0.0, (px - rect.x) / rect.w))
         try:
             send_command("jump", value=round(frac, 4))
-        except Exception as exc:
+        except DAEMON_UNREACHABLE as exc:
             self.toast = str(exc)
 
     def _seek_at(self, bar_row: int, bar_x: int, bar_w: int) -> None:
@@ -855,7 +869,7 @@ class Renderer:
         frac = min(1.0, max(0.0, float(self._last_position) / 3600.0))
         try:
             send_command("jump", value=round(frac, 4))
-        except Exception as exc:
+        except DAEMON_UNREACHABLE as exc:
             self.toast = str(exc)
 
     def dead_affordances(self) -> list[str]:
@@ -1768,7 +1782,7 @@ class Renderer:
         if key == "q":
             try:
                 send_command("quit")
-            except Exception as exc:
+            except DAEMON_UNREACHABLE as exc:
                 self.toast = str(exc)
             return False
         if len(key) == 1 and key.isprintable() and key != " ":
@@ -1779,7 +1793,7 @@ class Renderer:
         if key == " ":
             try:
                 send_command("toggle")
-            except Exception as exc:
+            except DAEMON_UNREACHABLE as exc:
                 self.toast = str(exc)
         return True
 

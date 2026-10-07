@@ -128,7 +128,7 @@ def test_search_bar_is_drawn_at_every_size():
 def test_search_bar_is_registered_as_clickable():
     rec = Recorder()
     drawer = SurfaceDrawer(make_actions(rec))
-    grid, put, _ = make_canvas(80, 24)
+    _grid, put, _ = make_canvas(80, 24)
     drawer.draw_search_bar(put, SearchBar(), metrics(80, 24), 0)
     assert "search.focus" in drawer.interactive
 
@@ -136,7 +136,7 @@ def test_search_bar_is_registered_as_clickable():
 def test_clicking_the_bar_focuses_it():
     rec = Recorder()
     drawer = SurfaceDrawer(make_actions(rec))
-    grid, put, _ = make_canvas(80, 24)
+    _grid, put, _ = make_canvas(80, 24)
     m = metrics(80, 24)
     drawer.draw_search_bar(put, SearchBar(), m, 0)
     drawer.click(m.gutter + 2, 0)
@@ -227,7 +227,7 @@ def test_search_bar_fits_at_40_columns():
 def test_submit_region_exists_only_while_focused():
     rec = Recorder()
     drawer = SurfaceDrawer(make_actions(rec))
-    grid, put, _ = make_canvas(80, 24)
+    _grid, put, _ = make_canvas(80, 24)
     m = metrics(80, 24)
     bar = SearchBar(query="m83")
     drawer.draw_search_bar(put, bar, m, 0)
@@ -242,7 +242,7 @@ def test_submit_region_exists_only_while_focused():
 def test_submit_passes_the_current_query():
     rec = Recorder()
     drawer = SurfaceDrawer(make_actions(rec))
-    grid, put, _ = make_canvas(80, 24)
+    _grid, put, _ = make_canvas(80, 24)
     m = metrics(80, 24)
     bar = SearchBar(query="radiohead")
     bar.focus()
@@ -254,7 +254,7 @@ def test_submit_passes_the_current_query():
 def test_suggestions_are_each_clickable():
     rec = Recorder()
     drawer = SurfaceDrawer(make_actions(rec))
-    grid, put, _ = make_canvas(80, 24)
+    _grid, put, _ = make_canvas(80, 24)
     m = metrics(80, 24)
     suggestions = [SearchSuggestion("m83"), SearchSuggestion("miles davis")]
     drawer.draw_suggestions(put, suggestions, m, 2, 10)
@@ -317,7 +317,7 @@ def test_artist_shelf_keeps_the_artists_own_capitalisation():
 def test_no_suggestions_draws_nothing():
     rec = Recorder()
     drawer = SurfaceDrawer(make_actions(rec))
-    grid, put, _ = make_canvas(80, 24)
+    _grid, put, _ = make_canvas(80, 24)
     drawer.draw_suggestions(put, [], metrics(80, 24), 2, 10)
     assert len(drawer.interactive) == 0
 
@@ -325,7 +325,7 @@ def test_no_suggestions_draws_nothing():
 def test_suggestions_respect_available_rows():
     rec = Recorder()
     drawer = SurfaceDrawer(make_actions(rec))
-    grid, put, _ = make_canvas(80, 24)
+    _grid, put, _ = make_canvas(80, 24)
     suggestions = [SearchSuggestion(f"q{i}") for i in range(20)]
     drawer.draw_suggestions(put, suggestions, metrics(80, 24), 2, available_rows=3)
     assert len(drawer.interactive) == 3
@@ -394,7 +394,7 @@ def test_home_navigation_is_inert_with_no_shelves():
 
 def test_home_renders_at_all_four_sizes():
     for cols, rows in SIZES:
-        drawer, view, rec, grid, put = render_home(cols, rows)
+        _drawer, _view, _rec, grid, _put = render_home(cols, rows)
         drawn = "\n".join("".join(row) for row in grid)
         assert drawn.strip(), f"home screen is blank at {cols}x{rows}"
         assert len(grid) == rows
@@ -403,26 +403,26 @@ def test_home_renders_at_all_four_sizes():
 
 
 def test_home_shows_shelf_titles():
-    drawer, view, rec, grid, put = render_home(100, 30)
+    _drawer, view, _rec, grid, _put = render_home(100, 30)
     text = "\n".join("".join(row) for row in grid)
     for shelf in view.shelves:
         assert shelf.title in text, f"{shelf.title} missing from the home screen"
 
 
 def test_home_shows_card_titles():
-    drawer, view, rec, grid, put = render_home(100, 30)
+    _drawer, view, _rec, grid, _put = render_home(100, 30)
     text = "\n".join("".join(row) for row in grid)
     assert view.shelves[0].tracks[0].title in text
 
 
 def test_cold_start_renders_for_a_new_user():
-    drawer, view, rec, grid, put = render_home(100, 30, Library())
+    _drawer, view, _rec, grid, _put = render_home(100, 30, Library())
     text = "\n".join("".join(row) for row in grid)
     assert "Welcome to MYX" in text or view.shelves
 
 
 def test_selected_card_shows_a_marker():
-    drawer, view, rec, grid, put = render_home(100, 30)
+    drawer, view, _rec, grid, put = render_home(100, 30)
     view.selected_shelf = 0
     view.selected_card = 0
     drawer.interactive.clear()
@@ -435,7 +435,7 @@ def test_selected_card_shows_a_marker():
 
 def test_home_draws_nothing_outside_its_band():
     """Cards must not spill past the rows they were given."""
-    drawer, view, rec, grid, put = render_home(100, 30)
+    drawer, _view, _rec, _grid, _put = render_home(100, 30)
     registered = [r for r in drawer.interactive if r.id.startswith("card:")]
     for region in registered:
         assert region.rect.y < 30
@@ -449,7 +449,7 @@ def test_home_draws_nothing_outside_its_band():
 
 def test_home_frame_has_no_dead_affordances():
     """Every drawn control must do something when clicked."""
-    drawer, view, rec, grid, put = render_home(100, 30)
+    drawer, _view, _rec, _grid, _put = render_home(100, 30)
     report = drawer.audit()
     assert report.dead == [], f"dead controls: {report.dead}"
     assert report.ok
@@ -458,7 +458,7 @@ def test_home_frame_has_no_dead_affordances():
 def test_search_frame_has_no_dead_affordances():
     rec = Recorder()
     drawer = SurfaceDrawer(make_actions(rec))
-    grid, put, _ = make_canvas(100, 30)
+    _grid, put, _ = make_canvas(100, 30)
     m = metrics(100, 30)
     bar = SearchBar(query="test")
     bar.focus()
@@ -468,20 +468,20 @@ def test_search_frame_has_no_dead_affordances():
 
 
 def test_everything_clickable_is_reachable_by_keyboard():
-    drawer, view, rec, grid, put = render_home(100, 30)
+    drawer, _view, _rec, _grid, _put = render_home(100, 30)
     report = drawer.audit()
     assert report.mouse_only == [], f"mouse-only controls: {report.mouse_only}"
 
 
 def test_no_dead_affordances_at_any_size():
     for cols, rows in SIZES:
-        drawer, view, rec, grid, put = render_home(cols, rows)
+        drawer, _view, _rec, _grid, _put = render_home(cols, rows)
         report = drawer.audit()
         assert report.dead == [], f"{cols}x{rows} has dead controls: {report.dead}"
 
 
 def test_clicking_a_track_card_plays_it():
-    drawer, view, rec, grid, put = render_home(100, 30)
+    drawer, view, rec, _grid, _put = render_home(100, 30)
     shelf = view.shelves[0]
     track = shelf.tracks[0]
     rect = view.card_rects[card_key(shelf.id, track.id)]
@@ -496,7 +496,7 @@ def test_clicking_a_station_starts_that_station():
     The home screen is taller than some terminals, so this scrolls to the
     station shelf rather than assuming it lands on the first screen.
     """
-    drawer, view, rec, grid, put = render_home(100, 30)
+    drawer, view, rec, _grid, put = render_home(100, 30)
     m = metrics(100, 30)
     shelf = next(s for s in view.shelves if s.id == "stations")
     station = shelf.tracks[0]
@@ -517,7 +517,7 @@ def test_clicking_a_station_starts_that_station():
 
 def test_every_shelf_is_reachable_by_scrolling():
     """No shelf may be permanently invisible — that is a dead section."""
-    drawer, view, rec, grid, put = render_home(100, 30)
+    drawer, view, _rec, _grid, put = render_home(100, 30)
     m = metrics(100, 30)
 
     def visible() -> set[str]:
@@ -544,13 +544,13 @@ def test_dropped_shelves_are_reported():
     A short terminal is the real overflow case: four shelf headers plus
     their cards cannot fit in a 12-row band.
     """
-    drawer, view, rec, grid, put = render_home(100, 12)
+    _drawer, view, _rec, _grid, _put = render_home(100, 12)
     assert view.dropped_shelf_ids, "12 rows cannot fit four full shelves"
     assert view.has_more_below
 
 
 def test_nothing_is_dropped_when_everything_fits():
-    drawer, view, rec, grid, put = render_home(100, 30)
+    _drawer, view, _rec, _grid, _put = render_home(100, 30)
     assert view.dropped_shelf_ids == [], "100x30 fits all four shelves"
     assert not view.has_more_below
 
@@ -564,7 +564,7 @@ def test_scroll_never_goes_negative():
 
 
 def test_clicking_an_artist_opens_its_page():
-    drawer, view, rec, grid, put = render_home(100, 30)
+    drawer, view, rec, _grid, _put = render_home(100, 30)
     shelf = next((s for s in view.shelves if s.id == "artists"), None)
     if shelf is None:
         return
@@ -581,7 +581,7 @@ def test_card_appearing_in_two_shelves_stays_clickable_in_both():
     first, silently making the Liked card unclickable. Each shelf needs its own
     target.
     """
-    drawer, view, rec, grid, put = render_home(100, 30)
+    drawer, view, rec, _grid, _put = render_home(100, 30)
     fav = next(s for s in view.shelves if s.id == "favourites")
     recent = next(s for s in view.shelves if s.id == "recent")
     shared = {t.id for t in fav.tracks} & {t.id for t in recent.tracks}
@@ -603,7 +603,7 @@ def test_card_appearing_in_two_shelves_stays_clickable_in_both():
 
 
 def test_clicking_the_chevron_opens_the_shelf():
-    drawer, view, rec, grid, put = render_home(100, 30)
+    drawer, view, rec, _grid, _put = render_home(100, 30)
     shelf = view.shelves[0]
     rect = drawer.interactive.get(f"shelf.{shelf.id}")
     assert rect is not None, "a chevron is drawn, so its row must be clickable"
@@ -613,7 +613,7 @@ def test_clicking_the_chevron_opens_the_shelf():
 
 def test_every_drawn_chevron_is_registered():
     """A chevron glyph must never appear without a clickable row behind it."""
-    drawer, view, rec, grid, put = render_home(100, 30)
+    drawer, _view, _rec, grid, _put = render_home(100, 30)
     text = "\n".join("".join(row) for row in grid)
     if CHEVRON not in text:
         return
@@ -622,13 +622,13 @@ def test_every_drawn_chevron_is_registered():
 
 
 def test_clicking_blank_space_does_nothing():
-    drawer, view, rec, grid, put = render_home(100, 30)
+    drawer, _view, rec, _grid, _put = render_home(100, 30)
     drawer.click(99, 29)
     assert not rec.calls, "a click on nothing must not fire an action"
 
 
 def test_toggle_favourite_is_reachable():
-    drawer, view, rec, grid, put = render_home(100, 30)
+    drawer, _view, rec, _grid, _put = render_home(100, 30)
     hearted = [r for r in drawer.interactive if r.id.startswith("favourite:")]
     assert hearted, "track cards should offer favouriting"
     drawer.click(hearted[0].rect.x, hearted[0].rect.y)
@@ -637,7 +637,7 @@ def test_toggle_favourite_is_reachable():
 
 def test_station_cards_do_not_offer_favouriting():
     """A heart on a station would be an affordance with no meaning."""
-    drawer, view, rec, grid, put = render_home(100, 30)
+    drawer, view, _rec, _grid, _put = render_home(100, 30)
     hearts = {
         r.id.split("/", 1)[1] for r in drawer.interactive if r.id.startswith("favourite:")
     }
@@ -651,7 +651,7 @@ def test_registry_is_rebuilt_each_frame_not_accumulated():
     drawer = SurfaceDrawer(make_actions(rec))
     view = HomeView(library=seeded_library())
     view.refresh(now=NOW)
-    grid, put, _ = make_canvas(100, 30)
+    _grid, put, _ = make_canvas(100, 30)
     m = metrics(100, 30)
     for _ in range(3):
         drawer.interactive.clear()
@@ -661,7 +661,7 @@ def test_registry_is_rebuilt_each_frame_not_accumulated():
 
 
 def test_audit_summary_is_human_readable():
-    drawer, view, rec, grid, put = render_home(100, 30)
+    drawer, _view, _rec, _grid, _put = render_home(100, 30)
     summary = drawer.audit().summary()
     assert "all live" in summary
 
@@ -672,7 +672,7 @@ def test_audit_summary_is_human_readable():
 
 
 def test_press_event_routes_through_the_map():
-    drawer, view, rec, grid, put = render_home(100, 30)
+    drawer, view, _rec, _grid, _put = render_home(100, 30)
     shelf = view.shelves[0]
     track = shelf.tracks[0]
     rect = view.card_rects[card_key(shelf.id, track.id)]
@@ -683,7 +683,7 @@ def test_press_event_routes_through_the_map():
 
 
 def test_wheel_over_a_card_resolves_a_region():
-    drawer, view, rec, grid, put = render_home(100, 30)
+    drawer, view, _rec, _grid, _put = render_home(100, 30)
     shelf = view.shelves[0]
     track = shelf.tracks[0]
     rect = view.card_rects[card_key(shelf.id, track.id)]
@@ -695,6 +695,6 @@ def test_supplied_map_is_used():
     """The host owns the map, so clicks and the renderer share one registry."""
     shared = InteractiveMap()
     drawer = SurfaceDrawer(make_actions(Recorder()), interactive=shared)
-    grid, put, _ = make_canvas(80, 24)
+    _grid, put, _ = make_canvas(80, 24)
     drawer.draw_search_bar(put, SearchBar(), metrics(80, 24), 0)
     assert "search.focus" in shared
