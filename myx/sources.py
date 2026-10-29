@@ -14,6 +14,10 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from . import __version__
+
+USER_AGENT = f"myx/{__version__}"
+
 YTDLP = shutil.which("yt-dlp") or "/opt/homebrew/bin/yt-dlp"
 TIMEOUT = 20
 MAX_THUMB_BYTES = 10 * 1024 * 1024  # 10 MiB cap against unbounded stream DoS
@@ -296,7 +300,7 @@ def cache_thumb(url_or_id: str, thumb_url: str) -> str:
         raise SourcesError("refusing to use symlinked thumbnail cache path")
     if path.exists() and path.stat().st_size > 0:
         return str(path)
-    req = urllib.request.Request(validated_url, headers={"User-Agent": "myx/0.2"})
+    req = urllib.request.Request(validated_url, headers={"User-Agent": USER_AGENT})
     opener = urllib.request.build_opener(_SafeRedirectHandler())
     try:
         with opener.open(req, timeout=TIMEOUT) as resp:
@@ -339,7 +343,7 @@ def lyrics(
         except (TypeError, ValueError, OverflowError):
             pass
     url = "https://lrclib.net/api/get?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"User-Agent": "myx/0.2"})
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
             if resp.status == 404:
@@ -476,7 +480,7 @@ def sponsorblock_segments(video_id: str) -> list[dict[str, Any]]:
     cats_json = json.dumps(list(SPONSORBLOCK_CATEGORIES))
     params = urllib.parse.urlencode({"videoID": vid, "categories": cats_json})
     url = f"https://sponsor.ajay.app/api/skipSegments?{params}"
-    req = urllib.request.Request(url, headers={"User-Agent": "myx/0.2"})
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=4) as resp:
             if resp.status == 404:

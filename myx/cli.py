@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from tempfile import gettempdir
 
-from . import tui
+from . import __version__, tui, updater
 
 LOCK_PATH = Path(gettempdir()) / "myx.lock"
 CMD_SOCK = Path(os.environ.get("MYX_CMD_SOCK", Path(gettempdir()) / "myx-cmd.sock"))
@@ -31,6 +31,8 @@ REQUIRED_BINS = {
 _RESERVED_WORDS = {
     "mcp",
     "doctor",
+    "update",
+    "upgrade",
     "play",
     "search",
     "help",
@@ -84,6 +86,12 @@ def _looks_like_url_or_id(arg: str) -> bool:
 
 
 def _add_common_flags(parser: argparse.ArgumentParser, *, include_help: bool = True) -> None:
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="store_true",
+        help="Print MYX version and detected install method, then exit",
+    )
     parser.add_argument("--search", help="Open search results into the queue")
     parser.add_argument(
         "--lyrics-only", action="store_true", help="Developer aid: start in lyrics view"
@@ -163,6 +171,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if not argv:
         return argparse.Namespace(
             url=None,
+            version=False,
             search=None,
             lyrics_only=False,
             state=False,
@@ -217,6 +226,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Attempt to auto-fix issues (brew install/upgrade, stale lock cleanup)",
     )
+    upd_p = sub.add_parser(
+        "update",
+        aliases=["upgrade"],
+        help="Update MYX (brew/uv/pipx/pip/git) and media tools (yt-dlp/mpv/ffmpeg)",
+    )
+    upd_p.add_argument(
+        "--check",
+        "--dry-run",
+        dest="check",
+        action="store_true",
+        help="Check latest version and print planned update commands without running them",
+    )
+    upd_p.add_argument(
+        "--only-myx",
+        dest="only_myx",
+        action="store_true",
+        help="Only update the MYX package itself",
+    )
+    upd_p.add_argument(
+        "--only-deps",
+        dest="only_deps",
+        action="store_true",
+        help="Only update yt-dlp / mpv / ffmpeg",
+    )
+    upd_p.add_argument(
+        "--git",
+        dest="from_git",
+        action="store_true",
+        help="Force updating MYX directly from GitHub repository",
+    )
+    upd_p.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        help="Output machine-readable JSON update report",
+    )
+    sub.add_parser("version", help="Print MYX version and install method")
     return parser.parse_args(argv)
 
 
@@ -550,6 +596,22 @@ def queue_search(query: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if getattr(args, "version", False) or getattr(args, "subcommand", None) == "version":
+        info = updater.detect_install_method()
+        print(f"myx {__version__} ({info['method']})")
+        return 0
+    if getattr(args, "subcommand", None) in ("update", "upgrade"):
+        as_json = bool(getattr(args, "as_json", False))
+        report = updater.run_update(
+            check_only=bool(getattr(args, "check", False)),
+            only_myx=bool(getattr(args, "only_myx", False)),
+            only_deps=bool(getattr(args, "only_deps", False)),
+            from_git=bool(getattr(args, "from_git", False)),
+            quiet=as_json,
+        )
+        if as_json:
+            print(json.dumps(report, indent=2))
+        return 0 if report.get("ok") else 1
     if getattr(args, "subcommand", None) == "mcp":
         from .mcp import serve_stdio
 

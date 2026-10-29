@@ -20,7 +20,7 @@ from pathlib import Path
 from tempfile import gettempdir
 from typing import Any
 
-from . import sources
+from . import __version__, sources, updater
 
 try:
     from .player import (
@@ -104,7 +104,7 @@ def _candidate_mpv_socks() -> list[Path]:
 
 
 SERVER_NAME = "myx"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = __version__
 
 
 def _send_cmd(cmd: str, **payload: Any) -> dict[str, Any]:
@@ -522,6 +522,27 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "myx_update",
+        "description": "Check or update MYX (auto-detecting brew, uv, pipx, pip, or git) and media tools (yt-dlp, mpv, ffmpeg).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "check_only": {
+                    "type": "boolean",
+                    "description": "If true (default), check version and return planned commands without running them",
+                },
+                "only_myx": {
+                    "type": "boolean",
+                    "description": "Only update the MYX package",
+                },
+                "only_deps": {
+                    "type": "boolean",
+                    "description": "Only update yt-dlp / mpv / ffmpeg",
+                },
+            },
+        },
+    },
 ]
 
 
@@ -839,6 +860,19 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
         elif name == "myx_cache_track":
             return _tool_result(_send_cmd("cache_track", arg=args.get("id")))
+
+        elif name == "myx_update":
+            check_only = bool(args.get("check_only", True))
+            only_myx = bool(args.get("only_myx", False))
+            only_deps = bool(args.get("only_deps", False))
+            return _tool_result(
+                updater.run_update(
+                    check_only=check_only,
+                    only_myx=only_myx,
+                    only_deps=only_deps,
+                    quiet=True,
+                )
+            )
 
         else:
             return _tool_error(f"unknown tool: {name}")

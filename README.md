@@ -27,12 +27,14 @@ myx               # launches the app shell — just type to search
 
 ```sh
 # pipx (isolated, recommended for pip users)
-pipx install myx
+pipx install myx-player
 # or uv
-uv tool install myx
+uv tool install myx-player
 # or pip
-pip install myx
+pip install myx-player
 ```
+
+> Note: the PyPI distribution is `myx-player` (which installs the `myx` CLI command and `myx` Python module, avoiding collision with an unrelated `myx` robotics package on PyPI). Before the first PyPI release, you can also install directly from GitHub: `uv tool install git+https://github.com/factnest365-ops/myx.git`.
 
 Then make sure the system bins are present:
 
@@ -59,6 +61,19 @@ uv run myx --help
 ```
 
 Requires Python ≥ 3.11. Console script is `myx = myx.cli:main` (see `pyproject.toml`).
+
+### Updating MYX (`brew`, `uv`, `pipx`, `pip`, `git`)
+
+MYX includes a built-in package-manager-aware self-updater that upgrades both `myx` and your media stack (`yt-dlp`, `mpv`, `ffmpeg`):
+
+```sh
+myx --version         # prints version + detected install method (brew / uv / pipx / git-editable / pip)
+myx update --check    # dry-run: checks PyPI/GitHub release & prints planned commands
+myx update            # upgrades myx + yt-dlp/mpv/ffmpeg via your active package manager
+myx update --only-myx # upgrade myx package only
+myx update --only-deps # upgrade yt-dlp / mpv / ffmpeg only
+myx update --git      # force upgrade directly from GitHub HEAD
+```
 
 ### First run
 
@@ -150,8 +165,9 @@ err = "#ff4444"
 - `myx/tui.py` — alt-screen 12 fps renderer: reads state file, writes command socket, owns zero playback logic.
 - `myx/dsp.py` — Audiophile DSP config, 10 `lavfi` EQ/speed/pitch presets, 5-band parametric EQ, `dynaudnorm`, silence trimming, and smart crossfade gain curves.
 - `myx/library.py` — Thread-safe `sqlite3` WAL store (`0o700` dir / `0o600` db) for tracks, `♥` likes, playlists, M3U import/export, play history, per-track lyrics sync offsets, and offline Opus/M4A cache LRU eviction.
-- `myx/mcp.py` — stdio MCP server (JSON-RPC 2.0, no deps): exposes 26 tools over stdio by wrapping the same daemon IPC + `myx-state.json`. Agent-native, TUI-optional.
-- `myx/cli.py` — entrypoint, single-instance lockfile, bin checks, `--search` / `--lyrics-only`, headless controls (`--quit`, `--skip`, `--prev`, `--toggle`, `--vol`, `--seek`, `--jump`, `--mute`, `--loop`, `--clear`, `--like`, `--liked`, `--eq`, `--normalize`, `--crossfade`, `--sponsorblock`, `--import-playlist`, `--cache-track`), `--no-lyrics`, plus agent-friendly `myx --state` and `myx mcp`.
+- `myx/mcp.py` — stdio MCP server (JSON-RPC 2.0, no deps): exposes 27 tools over stdio by wrapping the same daemon IPC + `myx-state.json` + `myx/updater.py`. Agent-native, TUI-optional.
+- `myx/updater.py` — package-manager detector & self-updater (`brew`, `uv`, `pipx`, `pip`, `git-editable`) plus `yt-dlp`/`mpv`/`ffmpeg` upgrader.
+- `myx/cli.py` — entrypoint, single-instance lockfile, bin checks, `--version`, `myx update`, `--search` / `--lyrics-only`, headless controls (`--quit`, `--skip`, `--prev`, `--toggle`, `--vol`, `--seek`, `--jump`, `--mute`, `--loop`, `--clear`, `--like`, `--liked`, `--eq`, `--normalize`, `--crossfade`, `--sponsorblock`, `--import-playlist`, `--cache-track`), `--no-lyrics`, plus agent-friendly `myx --state` and `myx mcp`.
 
 ## Agent-native (MCP)
 
@@ -161,7 +177,7 @@ MYX is built agent-first: the TUI is a view, the daemon is the API. Agents don't
 myx --state              # pollable JSON — title/artist/position/queue/lyrics/dsp/chapters
 myx --no-lyrics URL      # skip lyrics fetching in headless or agent mode
 myx --skip               # headless controls: --quit, --prev, --toggle, --vol N, --like, --liked, --eq bass_boost
-myx mcp --stdio          # stdio MCP server — 26 tools
+myx mcp --stdio          # stdio MCP server — 27 tools
 myx "https://..."        # still works headless — mpv + yt-dlp, no TUI needed
 ```
 
@@ -175,7 +191,7 @@ Add to `~/.jcode/mcp.json` (jcode already has MYX installed):
 
 Skill is at `~/.jcode/skills/myx/SKILL.md` — auto-loaded. Any jcode agent can then call `myx_search`, `myx_play`, `myx_state`, etc. Also `myx-skill/SKILL.md` in the MYX repo for sharing.
 
-**MCP tools (26):** `myx_play(url|query)` · `myx_queue_add(url|query)` · `myx_search(query)` · `myx_state` · `myx_queue` · `myx_skip`/`myx_prev` · `myx_pause`/`myx_resume`/`myx_toggle` · `myx_seek(delta|position)` · `myx_volume(volume|delta)` · `myx_mute` · `myx_loop` · `myx_shuffle` · `myx_clear` · `myx_lyrics` · `myx_remove(index)` · `myx_play_index(index)` · `myx_eq(preset|bands)` · `myx_dsp(normalize|crossfade_s|trim_silence|sponsorblock)` · `myx_like(action)` · `myx_playlist(action|name|url|m3u)` · `myx_chapter(action)` · `myx_history(limit)` · `myx_cache_track(id)` — all backed by the daemon's `myx-cmd.sock` + `myx-state.json`; none touch the TUI.
+**MCP tools (27):** `myx_play(url|query)` · `myx_queue_add(url|query)` · `myx_search(query)` · `myx_state` · `myx_queue` · `myx_skip`/`myx_prev` · `myx_pause`/`myx_resume`/`myx_toggle` · `myx_seek(delta|position)` · `myx_volume(volume|delta)` · `myx_mute` · `myx_loop` · `myx_shuffle` · `myx_clear` · `myx_lyrics` · `myx_remove(index)` · `myx_play_index(index)` · `myx_eq(preset|bands)` · `myx_dsp(normalize|crossfade_s|trim_silence|sponsorblock)` · `myx_like(action)` · `myx_playlist(action|name|url|m3u)` · `myx_chapter(action)` · `myx_history(limit)` · `myx_cache_track(id)` · `myx_update(check_only|only_myx|only_deps)` — all backed by the daemon's `myx-cmd.sock` + `myx-state.json`; none touch the TUI.
 
 ## Security & Threat Model
 
@@ -186,10 +202,21 @@ MYX is a **single-user, local-machine** tool. Stated plainly:
 - **Supply-chain trust anchor**: stream URLs come from whatever `yt-dlp` resolves. Update it regularly (`brew upgrade yt-dlp`) — YouTube extractor breakage is the #1 failure mode, and MYX surfaces it as `[myx] stream resolve failed (...)` rather than dying silently.
 - **Tmpdir contract**: daemon and clients agree on the state/cmd socket paths via `TMPDIR`. If your MCP client sees a different `TMPDIR` than the daemon (common on macOS), set `MYX_FALLBACK_TMP=/tmp` for both, or rely on the built-in `/tmp` fallback scan.
 
-## Dev
+## Dev & Releasing
 
 ```sh
 uv run pytest -q
+python3 scripts/bump_release.py --verify   # verify pyproject.toml, uv.lock, __init__.py & Formula/myx.rb
 ```
 
 Tests are hermetic: no network, no real mpv — fixture JSON shapes and fake socket pairs.
+
+To cut a new release across PyPI (`pip` / `uv` / `pipx`), GitHub Releases, and Homebrew (`Formula/myx.rb`):
+
+```sh
+python3 scripts/bump_release.py 0.3.1
+git commit -am "chore(release): v0.3.1"
+git tag v0.3.1 && git push && git push --tags
+```
+
+GitHub Actions (`.github/workflows/release.yml`) automatically runs the test suite, builds the wheel + sdist, publishes to PyPI & GitHub Releases, computes the release tarball SHA256, and updates `Formula/myx.rb` (plus optional `homebrew-myx` tap).
