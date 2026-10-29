@@ -13,14 +13,13 @@ import re
 import socket
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
 from tempfile import gettempdir
 from typing import Any
 
-from . import __version__, sources, updater
+from . import __version__, ipc, sources, updater
 
 try:
     from .player import (
@@ -44,25 +43,11 @@ MAX_RPC_LINE_BYTES = 1024 * 1024  # 1 MiB cap per JSON-RPC line
 
 def _is_trusted_local_path(path: Path) -> bool:
     """Reject symlinks and files owned by a different local UID."""
-    try:
-        if path.is_symlink():
-            return False
-        if path.exists() and hasattr(os, "getuid"):
-            if path.stat().st_uid != os.getuid():
-                return False
-        return True
-    except OSError:
-        return False
+    return ipc.is_trusted(path)
 
 
 def _get_fallback_tmpdirs() -> list[Path]:
-    dirs = [Path("/tmp"), Path(tempfile.gettempdir())]
-    if tmp := os.environ.get("MYX_FALLBACK_TMP"):
-        dirs.append(Path(tmp))
-    env_tmp = os.environ.get("TMPDIR")
-    if env_tmp:
-        dirs.append(Path(env_tmp))
-    return dirs
+    return ipc.fallback_tmpdirs()
 
 
 def _candidate_states() -> list[Path]:
@@ -108,35 +93,18 @@ SERVER_VERSION = __version__
 
 
 def _send_cmd(cmd: str, **payload: Any) -> dict[str, Any]:
-    msg = {"cmd": cmd, **payload}
-    sock_timeout = 22.0 if cmd in ("search", "search_query") else 2.5
     last_err: Exception | None = None
-    for sock_path in _candidate_cmd_socks():
+    candidates = _candidate_cmd_socks()
+    for sock_path in candidates:
         if not _is_trusted_local_path(sock_path):
             continue
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-                s.settimeout(2.0)
-                s.connect(str(sock_path))
-                s.sendall((json.dumps(msg) + "\n").encode("utf-8"))
-                data = b""
-                s.settimeout(sock_timeout)
-                while len(data) < 1024 * 1024:
-                    chunk = s.recv(8192)
-                    if not chunk:
-                        break
-                    data += chunk
-                    if b"\n" in data:
-                        break
-            line = (
-                data.decode(errors="ignore").strip().splitlines()[0] if data else "{}"
-            )
-            return json.loads(line or "{}")
+            return ipc.send_command(cmd, sock_path=sock_path, **payload)
         except Exception as e:
             last_err = e
             continue
     raise RuntimeError(
-        f"myx daemon not reachable (tried {', '.join(str(p) for p in _candidate_cmd_socks())}): {last_err}"
+        f"myx daemon not reachable (tried {', '.join(str(p) for p in candidates)}): {last_err}"
     )
 
 
@@ -245,25 +213,15 @@ def _read_state() -> dict[str, Any]:
             pid = int(lock.read_text(encoding="utf-8").strip())
             os.kill(pid, 0)
             if p.exists() and _daemon_reachable(cmd_sock):
-                state = json.loads(p.read_text(encoding="utf-8"))
-                if isinstance(state, dict):
-                    return _hydrate_queue(state)
-                return empty
+                state = ipc.read_state_file(p)
+                return _hydrate_queue(state) if state is not None else empty
         except (OSError, ValueError, TypeError):
             continue
     return empty
 
 
 def _daemon_reachable(cmd_sock: Path) -> bool:
-    if not cmd_sock.exists() or not _is_trusted_local_path(cmd_sock):
-        return False
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(0.5)
-            sock.connect(str(cmd_sock))
-            return True
-    except OSError:
-        return False
+    return ipc.is_alive(cmd_sock=cmd_sock)
 
 
 def _spotify_search(q: str) -> list[dict[str, Any]]:

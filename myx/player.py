@@ -15,14 +15,16 @@ import urllib.parse
 from pathlib import Path
 from typing import Any
 
-from . import sources
+from . import ipc, sources
 from .dsp import DSPConfig, compute_crossfade_gain, mpv_dsp_commands
 from .library import Library
 
-TMPDIR = Path(tempfile.gettempdir())
-MPV_SOCK = Path(os.environ.get("MYX_MPV_SOCK", TMPDIR / "myx-mpv.sock"))
-CMD_SOCK = Path(os.environ.get("MYX_CMD_SOCK", TMPDIR / "myx-cmd.sock"))
-STATE_PATH = Path(os.environ.get("MYX_STATE", TMPDIR / "myx-state.json"))
+# Rebound here so this process can be pointed at a temp dir in tests.
+TMPDIR = ipc.TMPDIR
+MPV_SOCK = ipc.MPV_SOCK
+CMD_SOCK = ipc.CMD_SOCK
+STATE_PATH = ipc.STATE_PATH
+LOCK_PATH = ipc.LOCK_PATH
 
 MAX_CMD_BYTES = 65536
 MAX_CACHE_ENTRIES = 512
@@ -282,10 +284,7 @@ class PlayerDaemon:
     def _candidate_cmd_socks(self) -> list[Path]:
         seen: set[Path] = set()
         out: list[Path] = []
-        fallback_tmpdirs = [Path("/tmp"), Path(tempfile.gettempdir())]
-        if tmp := os.environ.get("MYX_FALLBACK_TMP"):
-            fallback_tmpdirs.append(Path(tmp))
-        for p in [CMD_SOCK] + [d / "myx-cmd.sock" for d in fallback_tmpdirs]:
+        for p in [CMD_SOCK] + [d / "myx-cmd.sock" for d in ipc.fallback_tmpdirs()]:
             if p not in seen:
                 seen.add(p)
                 out.append(p)
@@ -329,7 +328,7 @@ class PlayerDaemon:
         return True
 
     def _acquire_singleton(self, url: str | None) -> bool:
-        lock_path = TMPDIR / "myx.lock"
+        lock_path = LOCK_PATH
         try:
             return self._open_lock_exclusive(lock_path)
         except FileExistsError:
@@ -440,7 +439,7 @@ class PlayerDaemon:
         except OSError:
             pass
         try:
-            lock_path = TMPDIR / "myx.lock"
+            lock_path = LOCK_PATH
             if lock_path.exists() and not lock_path.is_symlink():
                 raw = lock_path.read_text(encoding="utf-8", errors="ignore").strip()
                 if not raw or raw == str(os.getpid()):

@@ -17,11 +17,11 @@ import time
 from pathlib import Path
 from tempfile import gettempdir
 
-from . import __version__, tui, updater
+from . import __version__, ipc, tui, updater
 
-LOCK_PATH = Path(gettempdir()) / "myx.lock"
-CMD_SOCK = Path(os.environ.get("MYX_CMD_SOCK", Path(gettempdir()) / "myx-cmd.sock"))
-MPV_SOCK = Path(os.environ.get("MYX_MPV_SOCK", Path(gettempdir()) / "myx-mpv.sock"))
+LOCK_PATH = ipc.LOCK_PATH
+CMD_SOCK = ipc.CMD_SOCK
+MPV_SOCK = ipc.MPV_SOCK
 REQUIRED_BINS = {
     "mpv": "install mpv (macOS: brew install mpv)",
     "yt-dlp": "install yt-dlp (macOS: brew install yt-dlp)",
@@ -59,19 +59,6 @@ _YELLOW = "\x1b[33m"
 _DIM = "\x1b[2m"
 _BOLD = "\x1b[1m"
 _RESET = "\x1b[0m"
-
-
-def _is_safe_path(path: Path) -> bool:
-    """Reject symlinks and files owned by a different UID."""
-    try:
-        if path.is_symlink():
-            return False
-        if path.exists() and hasattr(os, "getuid"):
-            if path.stat().st_uid != os.getuid():
-                return False
-        return True
-    except OSError:
-        return False
 
 
 def _looks_like_url_or_id(arg: str) -> bool:
@@ -318,7 +305,7 @@ def doctor_check() -> dict:
     lock_running = False
     stale_lock = False
     try:
-        if _is_safe_path(LOCK_PATH):
+        if ipc.is_trusted(LOCK_PATH):
             raw = LOCK_PATH.read_text().strip()
             if raw:
                 lock_pid = int(raw)
@@ -488,51 +475,25 @@ def _pid_running(pid: int) -> bool:
 
 
 def read_lock() -> int | None:
-    try:
-        if not _is_safe_path(LOCK_PATH):
-            return None
-        pid = int(LOCK_PATH.read_text().strip())
-    except Exception:
-        return None
-    return pid if _pid_running(pid) else None
+    return ipc.read_lock(lock_path=LOCK_PATH)
 
 
 def write_lock(pid: int) -> None:
-    if LOCK_PATH.is_symlink():
-        raise PermissionError("refusing to write symlinked lockfile")
-    flags = os.O_CREAT | os.O_TRUNC | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(LOCK_PATH, flags, 0o600)
-    try:
-        os.write(fd, str(pid).encode("utf-8"))
-    finally:
-        os.close(fd)
+    ipc.write_lock(pid, lock_path=LOCK_PATH)
 
 
 def daemon_running() -> bool:
-    pid = read_lock()
-    if not pid or not CMD_SOCK.exists() or not _is_safe_path(CMD_SOCK):
+    if not read_lock():
         return False
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(0.5)
-            sock.connect(str(CMD_SOCK))
-            return True
-    except OSError:
-        return False
+    return ipc.is_alive(cmd_sock=CMD_SOCK)
 
 
 def _read_live_state() -> dict:
-    empty = {"playing": False, "paused": True, "queue": []}
+    empty = ipc.empty_state()
     if not daemon_running():
         return empty
     path = Path(os.environ.get("MYX_STATE") or (Path(gettempdir()) / "myx-state.json"))
-    if not _is_safe_path(path):
-        return empty
-    try:
-        state = json.loads(path.read_text(encoding="utf-8"))
-        return state if isinstance(state, dict) else empty
-    except (OSError, ValueError, TypeError):
-        return empty
+    return ipc.read_state_file(path) or empty
 
 
 SOCK_WAIT_S = 5.0
@@ -584,7 +545,7 @@ def cleanup(proc: subprocess.Popen[str] | None) -> None:
             proc.kill()
     _kill_mpv_socket()
     try:
-        if _is_safe_path(LOCK_PATH) and LOCK_PATH.read_text().strip() == str(proc.pid):
+        if ipc.is_trusted(LOCK_PATH) and LOCK_PATH.read_text().strip() == str(proc.pid):
             LOCK_PATH.unlink(missing_ok=True)
     except Exception:
         pass
@@ -723,7 +684,7 @@ def raise_sigterm() -> None:
 
 
 def _kill_mpv_socket() -> None:
-    if not MPV_SOCK.exists() or not _is_safe_path(MPV_SOCK):
+    if not MPV_SOCK.exists() or not ipc.is_trusted(MPV_SOCK):
         return
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:

@@ -7,13 +7,11 @@ commands to the player command socket. Playback logic lives in myx.player.
 from __future__ import annotations
 
 import base64
-import json
 import os
 import re
 import selectors
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import termios
@@ -24,7 +22,6 @@ import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from tempfile import gettempdir
 from typing import IO, Any
 
 try:  # numpy is allowed for the spectrum tap.
@@ -36,6 +33,11 @@ try:  # pillow is a core project dependency; use for fast Lanczos half-block art
     from PIL import Image
 except Exception:  # pragma: no cover
     Image = None  # type: ignore[assignment]
+
+try:
+    from . import ipc  # type: ignore
+except Exception:  # fallback for hermetic env without package install
+    from myx import ipc  # type: ignore
 
 try:
     from .picker import (  # type: ignore
@@ -54,8 +56,8 @@ except Exception:  # fallback for hermetic env without package install
         format_duration,
     )
 
-STATE_PATH = Path(os.environ.get("MYX_STATE", Path(gettempdir()) / "myx-state.json"))
-CMD_SOCK = Path(os.environ.get("MYX_CMD_SOCK", Path(gettempdir()) / "myx-cmd.sock"))
+STATE_PATH = ipc.STATE_PATH
+CMD_SOCK = ipc.CMD_SOCK
 FOOTER = "type to search · ? help · q quit · space pause · n next · p prev · s shuffle · +,- vol · l lyrics · enter play"
 CONTROLS_HINT = "[ ▶ Play ] [ ⏸ Pause ] [ ⏭ Next ] [ 🔀 Shuffle ]"
 AUTO_HINT = (
@@ -389,54 +391,30 @@ def load_theme() -> None:
             THEME[key] = value
 
 
-def read_state(path: Path = STATE_PATH) -> dict[str, Any]:
-    try:
-        if path.is_symlink():
-            raise PermissionError("refusing symlinked state file")
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return data
-    except FileNotFoundError:
-        return {
-            "version": 1,
-            "playing": False,
-            "paused": True,
-            "title": "MYX",
-            "artist": "Waiting for player",
-            "queue": [],
-        }
-    except Exception:
-        pass
+def _placeholder(title: str, artist: str) -> dict[str, Any]:
     return {
         "version": 1,
         "playing": False,
         "paused": True,
-        "title": "State unavailable",
-        "artist": "",
+        "title": title,
+        "artist": artist,
         "queue": [],
     }
 
 
+def read_state(path: Path | None = None) -> dict[str, Any]:
+    """State for display: a missing file is normal, a broken one is not."""
+    target = path or STATE_PATH
+    data = ipc.read_state_file(target)
+    if data is not None:
+        return data
+    if target.exists() or target.is_symlink():
+        return _placeholder("State unavailable", "")
+    return _placeholder("MYX", "Waiting for player")
+
+
 def send_command(cmd: str, **payload: Any) -> dict[str, Any]:
-    message = {"cmd": cmd, **payload}
-    sock_timeout = 22.0 if cmd in ("search", "search_query") else 2.5
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-        sock.settimeout(sock_timeout)
-        sock.connect(str(CMD_SOCK))
-        sock.sendall((json.dumps(message) + "\n").encode("utf-8"))
-        chunks: list[bytes] = []
-        total = 0
-        while total < 1024 * 1024:
-            chunk = sock.recv(8192)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total += len(chunk)
-            if b"\n" in chunk:
-                break
-    raw = b"".join(chunks).decode("utf-8", errors="replace").splitlines()
-    first = raw[0] if raw else ""
-    return json.loads(first or '{"ok": true}')
+    return ipc.send_command(cmd, sock_path=CMD_SOCK, **payload)
 
 
 def _terminate_proc(proc: Any) -> None:

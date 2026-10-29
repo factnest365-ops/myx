@@ -17,9 +17,15 @@ The target is a complete daily-driver music client that a **human operates from 
 - Headless controls: `--quit --skip --prev --toggle --vol N --seek --jump --mute --loop --clear --like --liked --eq --normalize --crossfade --sponsorblock --import-playlist --cache-track`, plus `--no-lyrics` and `--doctor [--fix]`.
 - `myx` with no arguments and no daemon - For You / empty-state hint.
 
-## Architecture - 9 modules, frozen contracts
+## Architecture - 10 modules, frozen contracts
 
 Dependency direction is a strict DAG. A module may import only what its contract declares, and the CONTRACT block is the authority. Tree leaves import nothing from `myx`.
+
+**`ipc.py`** - the only owner of the wire.
+Owns: `CMD_SOCK`, `MPV_SOCK`, `STATE_PATH`, `LOCK_PATH` (all env-overridable), the trust check (`is_trusted`: no symlinks, no foreign UID), `read_state_file`, `read_lock`, `write_lock`, `is_alive` (connect, never wait for a reply), `send_command`, `IpcError`, timeouts.
+Never: playback policy, rendering, network, SQLite. Imports nothing from `myx`.
+
+Every process binds its module-level path names to these values and passes them in, so a test can point one process at a temp directory. Policy stays with the caller: the TUI shows a placeholder for a missing state file, `myx --state` refuses to report state from a dead daemon.
 
 **`sources.py`** - the only module that fetches.
 Owns: `search`, `mix_chain` / `mix_chain_items`, `meta`, `stream_url`, `cache_thumb`, `cache_audio`, `lyrics` (lrclib), `playlist_items`, `sponsorblock_segments`, chapters.
@@ -28,7 +34,7 @@ Hardening is part of the contract: `_validate_video_id`, `_validate_http_url`, `
 
 **`player.py`** - `PlayerDaemon`, the only module that talks to mpv.
 Owns: JIT queue, 2-track mpv buffer, refill loop, stream cache with CDN-derived TTL, atomic state writes, command socket server, singleton lockfile, mpv healthcheck, EOF watchdog, DSP application, chapter tracking, crossfade, SponsorBlock skipping.
-Never: TUI rendering, MCP protocol, direct network fetches (go through `sources`).
+Never: TUI rendering, MCP protocol, direct network fetches (go through `sources`). Paths and the lockfile come from `ipc`.
 
 **`dsp.py`** - pure audio maths.
 Owns: `DSPConfig` (presets, 5-band parametric EQ, crossfade seconds), `build_lavfi_chain`, `build_mpv_af`, `mpv_dsp_commands`, `compute_crossfade_gain`.
@@ -52,7 +58,7 @@ Never: owning playback, owning daemon lifecycle, TUI.
 
 **`tui.py`** - the renderer.
 Owns: theme + `~/.config/myx/config.toml`, display-width maths (`cell_len`, `crop`, `clip`, `pad`), art protocols (kitty -> iterm2 -> halfblock), spectrum taps (cava -> ffmpeg), lyrics view, picker overlay, command palette, mouse, keymap.
-Never: **imports from `myx` other than `picker`**, network fetches, SQLite, playback decisions. It reads the state file and writes the command socket. That is the whole boundary.
+Never: **imports from `myx` other than `ipc` and `picker`**, network fetches, SQLite, playback decisions. It reads the state file and writes the command socket. That is the whole boundary.
 
 **`cli.py`** - entrypoint.
 Owns: argument parsing, bin checks, daemon boot/cleanup, lockfile, headless control routing, doctor.
@@ -78,19 +84,20 @@ Machine-read by `tests/test_bible.py`. Keep the markers.
   "deps": ["numpy>=2.0.0", "pillow>=10.0.0"],
   "dev_deps": ["pytest>=8.0.0"],
   "console_script": "myx",
-  "module_count": 9,
+  "module_count": 10,
   "mcp_tool_count": 27,
   "max_function_lines": 80,
   "modules": {
     "sources": [],
     "dsp": [],
+    "ipc": [],
     "library": [],
     "picker": [],
     "updater": [],
-    "player": ["dsp", "library", "sources"],
-    "mcp": ["player", "sources", "updater"],
-    "tui": ["picker"],
-    "cli": ["mcp", "tui", "updater"]
+    "player": ["dsp", "ipc", "library", "sources"],
+    "mcp": ["ipc", "player", "sources", "updater"],
+    "tui": ["ipc", "picker"],
+    "cli": ["ipc", "mcp", "tui", "updater"]
   },
   "grandfathered_functions": {
     "player.handle_command": 580,
@@ -118,7 +125,6 @@ Machine-read by `tests/test_bible.py`. Keep the markers.
 Recorded here so it is not rediscovered every session. Each item shrinks the contract when fixed.
 
 - `player.handle_command` (580 lines, 38 commands, 141 branches) and `mcp.handle_tool` (319) are if-chains. Target: dispatch tables, one small handler per command/tool.
-- Socket path, state path and daemon-liveness probing are re-implemented in `cli.py`, `mcp.py` and `tui.py`. Target: single `ipc.py` owner.
 - `tui.Renderer` is one 1465-line class. Target: split into draw units behind the same public surface.
 - `myx/player.py` mixes queue policy, mpv IPC, state serialisation and DSP application. Target: extract state serialisation.
 
