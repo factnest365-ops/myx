@@ -1,88 +1,140 @@
 # MYX - terminal music player for YouTube/YT Music radio
 
-Free-stack only: Python + mpv (playback/IPC) + yt-dlp (streams, search, metadata). No API keys, no accounts, no paid services. Reference look: orange-on-black TUI, queue sidebar left, huge centered album art, live spectrum below, synced-lyrics view, keybind footer.
+Free-stack only: Python + mpv (playback/IPC) + yt-dlp (streams, search, metadata). No API keys, no accounts, no paid services.
+
+The target is a complete daily-driver music client that a **human operates from the keyboard** and an **agent operates over MCP**. Orange-on-black TUI: queue sidebar left, huge centered album art, live spectrum below, synced-lyrics view, keybind footer. If a feature cannot be reached from both a keybind and an MCP tool, it is not finished.
+
+**This file is the spec.** It is enforced by `tests/test_bible.py`: the CONTRACT block below is parsed and asserted against the code. Changing a number here without changing code fails the build, and the reverse. Fix code or fix the bible - never widen a test to make it pass.
 
 ## Run targets
-- `myx "<youtube-or-ytmusic-url>"` starts radio: plays seed, refills forever via RD-chain (dedupe seen-set, eager first fill, keep buffer >= 2, fallback repeat when chain cached).
-- `myx --search "query"` opens search results into queue.
-- `myx mcp --stdio` runs as an MCP server over stdio (agent-native).
-- `myx --state` prints current player state as JSON and exits (agent-friendly).
-- `myx --version` prints version + detected package manager (`brew`, `uv`, `pipx`, `git-editable`, `pip`).
-- `myx update [--check] [--only-myx] [--only-deps] [--git]` auto-detects and upgrades MYX + `yt-dlp`/`mpv`/`ffmpeg`.
-- Headless controls: `--quit`, `--skip`, `--prev`, `--toggle`, `--vol N`, `--seek`, `--jump`, `--mute`, `--loop`, `--clear`, `--like`, `--liked`, `--eq`, `--normalize`, `--crossfade`, `--sponsorblock`, `--import-playlist`, `--cache-track`; `--no-lyrics` disables lyrics lookup.
 
-## Project memory
+- `myx "<url>"` - radio from a seed. RD chain refill, dedupe seen-set, eager first fill, fallback repeat when the chain is exhausted (`player.py`).
+- `myx --search "query"` - ytsearch20 into the queue.
+- `myx mcp --stdio` - MCP server, JSON-RPC 2.0, 27 tools, does not own playback.
+- `myx --state` - current state as JSON, exit. Agent-friendly.
+- `myx --version` - version + detected package manager (brew / uv / pipx / git-editable / pip).
+- `myx update [--check] [--only-myx] [--only-deps] [--git]` - upgrade app + `yt-dlp` / `mpv` / `ffmpeg`.
+- Headless controls: `--quit --skip --prev --toggle --vol N --seek --jump --mute --loop --clear --like --liked --eq --normalize --crossfade --sponsorblock --import-playlist --cache-track`, plus `--no-lyrics` and `--doctor [--fix]`.
+- `myx` with no arguments and no daemon - For You / empty-state hint.
 
-- State readers must require a live lockfile PID and a connectable command socket; state-file age is not a liveness signal.
-- Lyrics lookup runs off the state-write path so slow network calls cannot stall state updates.
-- MCP state handling falls back to the empty state for malformed JSON and non-object payloads; keep protocol behavior covered by `tests/test_mcp.py`.
+## Architecture - 9 modules, frozen contracts
 
-## Architecture (4 modules, fixed contracts)
+Dependency direction is a strict DAG. A module may import only what its contract declares, and the CONTRACT block is the authority. Tree leaves import nothing from `myx`.
 
-### myx/sources.py - yt-dlp + lyrics wrappers (pure functions)
-- `search(q) -> [{id,title,artist,duration,thumb}]` via yt-dlp `ytsearch20` json.
-- `mix_chain(video_id) -> [ids]` flat-playlist RD chain, extractor-args youtube:player_client=web,music.
-- `meta(video_id) -> {id,title,artist,duration,thumb}` (artist = uploader cleaned).
-- `cache_thumb(url_or_id, thumb_url) -> local path` under `~/Library/Caches/myx/thumbs/`.
-- `lyrics(title, artist, duration_s=None) -> {"lrc": str|None, "plain": str|None}` from https://lrclib.net API (free, no key). Never crash on miss; return Nones.
-- All network calls timeout 20s, raise SourcesError(msg) with human text.
+**`sources.py`** - the only module that fetches.
+Owns: `search`, `mix_chain` / `mix_chain_items`, `meta`, `stream_url`, `cache_thumb`, `cache_audio`, `lyrics` (lrclib), `playlist_items`, `sponsorblock_segments`, chapters.
+Never: mpv, playback state, SQLite, TUI.
+Hardening is part of the contract: `_validate_video_id`, `_validate_http_url`, `_SafeRedirectHandler` (blocks loopback / link-local / private redirects), symlink + oversize rejection on disk cache, `_sanitize_text` strips terminal escapes from untrusted titles.
 
-### myx/player.py - PlayerDaemon (runs standalone: `python -m myx.player <url>`)
-- Spawns `mpv --input-ipc-server=$TMPDIR/myx-mpv.sock --idle=yes --no-video --no-ytdl`.
-- JSON IPC over that socket (stdlib socket, no python-mpv dep). Commands in: toggle/pause/resume/skip/prev/vol N/shuffle/play_id ID/load URL/jump POS/del/play_index/quit.
-- JIT Queue & 2-track MPV buffer: MPV maintains a 2-track buffer (Track 0 currently playing, Track 1 pre-resolved next track for gapless transitions); remaining items (Tracks 2..N) are held in daemon memory as lightweight metadata (`id`, `title`, `artist`, `duration`, `thumb`, `stream_url=None`) with non-blocking stream resolution just-in-time as tracks approach playback.
-- Non-blocking IPC commands: `play_id`, `load`, and `search` return immediately; `play_id` triggers background radio refill via `_refill_loop` without blocking `handle_command`.
-- Refill loop thread: when queue <= 3, `mix_chain_items(current)` -> filter seen-set -> append metadata to queue; eager fill at start; retry/backoff on yt-dlp failure.
-- Non-blocking state out: writes atomically every tick (>=4 Hz while playing) to `$TMPDIR/myx-state.json`. Uncached thumbnails and lyrics resolve in background threads without blocking the 250ms tick loop.
-- Command server: listen `$TMPDIR/myx-cmd.sock`, one JSON cmd per line, reply `{"ok":true}` or `{"ok":false,"error":"..."}`.
-- Singleton lockfile at `$TMPDIR/myx.lock`; healthcheck loop restarts mpv on death/unresponsiveness; EOF watchdog kicks stalled tracks.
+**`player.py`** - `PlayerDaemon`, the only module that talks to mpv.
+Owns: JIT queue, 2-track mpv buffer, refill loop, stream cache with CDN-derived TTL, atomic state writes, command socket server, singleton lockfile, mpv healthcheck, EOF watchdog, DSP application, chapter tracking, crossfade, SponsorBlock skipping.
+Never: TUI rendering, MCP protocol, direct network fetches (go through `sources`).
 
-### myx/mcp.py - MCP server (stdio JSON-RPC 2.0, no external deps)
-- Exposes 27 tools over stdio by wrapping the daemon IPC + reading `$TMPDIR/myx-state.json` + `myx/updater.py`. Does not own playback.
-- Server identity: `myx` (`myx.__version__`, v0.3.0), protocol `2024-11-05`.
-- Tools:
-  - `myx_play(url|query)` — play a YouTube URL, video ID, or search query (e.g. 'blinding lights'); boots daemon if not running; falls back to direct mpv.
-  - `myx_queue_add(url|query)` — enqueue a track by search query, YouTube URL, or video ID.
-  - `myx_search(query)` — ytsearch20, enqueues all results; if daemon unreachable, returns results without enqueueing.
-  - `myx_state` — current player state (playing/paused, title/artist, position/duration, volume, queue, lyrics).
-  - `myx_queue` — upcoming tracks + current.
-  - `myx_skip` / `myx_prev` — playlist-next / playlist-prev.
-  - `myx_pause` / `myx_resume` / `myx_toggle` — pause control.
-  - `myx_volume(volume|delta)` — absolute 0..100 or relative ±N.
-  - `myx_shuffle` — shuffle queue.
-  - `myx_lyrics` — `{lrc, plain, title, artist}` for current track.
-  - `myx_remove(index)` — remove queue item by index.
-  - `myx_play_index(index)` — jump to queue item by index.
-- IPC: sends JSON cmds to `$TMPDIR/myx-cmd.sock`; reads state from `$TMPDIR/myx-state.json`; falls back across candidate tmpdirs.
-- Entry: `myx mcp --stdio` (cli.py routes here); direct: `python -m myx.mcp`.
+**`dsp.py`** - pure audio maths.
+Owns: `DSPConfig` (presets, 5-band parametric EQ, crossfade seconds), `build_lavfi_chain`, `build_mpv_af`, `mpv_dsp_commands`, `compute_crossfade_gain`.
+Never: IO of any kind. Imports nothing from `myx`.
 
-### myx/tui.py - renderer (reads state file, writes cmd socket; owns zero playback logic)
-- Raw mode, alt screen, ~12 fps loop. Stdlib termios/tty; ANSI escapes only.
-- Top bar: `M Y X` left; right view tabs `•• Now Playing · Lyrics · Queue`.
-- Left panel 38% width: section header `< Library  2/6 · 1799`, rows: index, title, dim artist right-aligned; playing row accent bg black text; played rows dim.
-- Center: album art max 40 rows square. Order: kitty graphics protocol (if KITTY_WINDOW_ID or term contains kitty) -> iterm2 inline images (OSC 1337 File) -> half-block RGB (ffmpeg -i thumb -vf scale=WxH -f rawvideo rgba, pure-python nearest-neighbor scale, two pixels per cell via ▀ fg/bg). Cache last drawn path; redraw only on change.
-- Under art: bold title, dim artist, `m:ss elapsed ──────o── m:ss` bar.
-- Bottom third: spectrum. Pluggable SpectrumSource: (a) CavaSource if `cava` binary exists (pipe raw ascii), else (b) FfmpegTapSource: `ffmpeg -re -i <stream_url> -f s16le -ac 1 -ar 8000 -` -> 64-bin log-scale FFT (numpy), 24 bars, accent color gradient, peak-hold dots. Known v1 limitation: tap latency vs playback accepted; document in README. If both unavailable: flat baseline.
-- Lyrics view: replaces art+spectrum area; plain centered lines, synced LRC highlights current line (accent), auto-follow, `[`/`]` offset nudge ±0.5s.
-- Footer keybinds: `space pause · n next · p prev · / search · s shuffle · +,- vol · l lyrics · tab view · j,k nav · enter play · d del · q quit`. Search prompt overlays bottom: query -> sources.search -> append all to queue, toast "queued N".
-- Theme dict: bg #0d0d0d fg #e8e3d8 accent #ff6b35 dim #7a756c err #ff4444. Optional override `~/.config/myx/config.toml`.
+**`library.py`** - the only module that touches SQLite.
+Owns: `Library` - tracks, likes, playlists, M3U import/export, play history, most-played, lyrics offsets, offline audio cache ledger.
+Never: network, mpv, TUI. Imports nothing from `myx`.
 
-### myx/cli.py - entrypoint
-argparse: positional url optional, --search, --lyrics-only flag dev aid, --no-lyrics, --state for agent JSON, headless --quit/--skip/--prev/--toggle/--vol N controls, and subcommand `mcp` for MCP server. Boots PlayerDaemon subprocess if not running (single-instance lockfile at `$TMPDIR/myx.lock`), then TUI. On quit: SIGTERM daemon, kill mpv, clean lockfile. Bin checks at boot: mpv, yt-dlp, ffmpeg — missing exits with install hint.
+**`picker.py`** - pure search / palette logic for the TUI.
+Owns: `fuzzy_score`, `fuzzy_filter`, `Debouncer`, `PickerState`, `command_palette_search`, result formatting.
+Never: IO, network, rendering. Imports nothing from `myx`.
 
-## Rules
-- uv project (`v0.3.0`). deps: numpy>=2.0.0, pillow>=10.0.0. dev: pytest>=8.0.0. Build: hatchling. Console script: `myx` -> `myx.cli:main`.
-- Packaging & releases: keep `myx/__init__.py`, `pyproject.toml`, `uv.lock`, and `Formula/myx.rb` synchronized via `python3 scripts/bump_release.py <version>` (verified in CI by `python3 scripts/bump_release.py --verify`). Tagging `vX.Y.Z` triggers `.github/workflows/release.yml` (PyPI, GitHub Release, and Homebrew formula SHA256 update).
-- External bins checked at boot: mpv, yt-dlp, ffmpeg; missing -> one-line install hint, exit 1.
-- No other deps. urllib for lrclib. No network calls in tui.py ever.
-- Tests (pytest, no network, no real mpv): sources JSON-shape fixtures parsed correctly; player state machine against fake socket pair; cmd protocol roundtrip; MCP tools list shape and handle_tool paths. `uv run pytest` green before any commit.
-- Conventional commits, commit after each working unit.
-- macOS/bash 3.2 irrelevant here (Python only), but keep everything runnable on macOS arm64 + Linux.
-- License: MIT (Copyright © 2026 Bhavya Singh).
+**`updater.py`** - self-update and diagnostics.
+Owns: `detect_install_method`, `build_dep_update_commands`, `check_latest_version`, `build_update_plan`, `run_update`.
+Never: playback, TUI. Imports nothing from `myx` except `__version__`.
+
+**`mcp.py`** - MCP server over stdio.
+Owns: JSON-RPC 2.0 framing, error codes, batch handling, the 27-tool surface, IPC to the daemon, direct-mpv fallback when no daemon is reachable.
+Never: owning playback, owning daemon lifecycle, TUI.
+
+**`tui.py`** - the renderer.
+Owns: theme + `~/.config/myx/config.toml`, display-width maths (`cell_len`, `crop`, `clip`, `pad`), art protocols (kitty -> iterm2 -> halfblock), spectrum taps (cava -> ffmpeg), lyrics view, picker overlay, command palette, mouse, keymap.
+Never: **imports from `myx` other than `picker`**, network fetches, SQLite, playback decisions. It reads the state file and writes the command socket. That is the whole boundary.
+
+**`cli.py`** - entrypoint.
+Owns: argument parsing, bin checks, daemon boot/cleanup, lockfile, headless control routing, doctor.
+
+## Laws
+
+1. **Size**: no function over 80 lines. Existing offenders are listed in `grandfathered_functions` and may only shrink.
+2. **One owner per resource**: a socket path, state path, or liveness probe is declared once and imported. A second copy is a defect.
+3. **DAG**: the import graph equals the CONTRACT block. No cycles.
+4. **Boundary**: `tui.py` never fetches and never decides playback.
+5. **Hygiene**: no bare `except:`, no `import *`.
+6. **Hermetic tests**: no network, no real mpv, no real yt-dlp. Everything through `monkeypatch` / fixtures.
+7. **Both doors**: a user-facing capability ships with a keybind and an MCP tool, or it is not finished.
+
+## CONTRACT
+
+Machine-read by `tests/test_bible.py`. Keep the markers.
+
+<!-- BEGIN CONTRACT -->
+```json
+{
+  "python": ">=3.11",
+  "deps": ["numpy>=2.0.0", "pillow>=10.0.0"],
+  "dev_deps": ["pytest>=8.0.0"],
+  "console_script": "myx",
+  "module_count": 9,
+  "mcp_tool_count": 27,
+  "max_function_lines": 80,
+  "modules": {
+    "sources": [],
+    "dsp": [],
+    "library": [],
+    "picker": [],
+    "updater": [],
+    "player": ["dsp", "library", "sources"],
+    "mcp": ["player", "sources", "updater"],
+    "tui": ["picker"],
+    "cli": ["mcp", "tui", "updater"]
+  },
+  "grandfathered_functions": {
+    "player.handle_command": 580,
+    "mcp.handle_tool": 319,
+    "player.write_state": 197,
+    "tui.handle_key": 160,
+    "tui._draw_now": 158,
+    "tui.render_once": 143,
+    "cli.main": 122,
+    "updater.detect_install_method": 116,
+    "tui._execute_command": 113,
+    "tui.handle_mouse": 111,
+    "tui._draw_search_picker": 106,
+    "updater.run_update": 104,
+    "cli._print_doctor": 100,
+    "cli.parse_args": 99,
+    "tui._draw_queue": 82
+  }
+}
+```
+<!-- END CONTRACT -->
+
+## Known debt
+
+Recorded here so it is not rediscovered every session. Each item shrinks the contract when fixed.
+
+- `player.handle_command` (580 lines, 38 commands, 141 branches) and `mcp.handle_tool` (319) are if-chains. Target: dispatch tables, one small handler per command/tool.
+- Socket path, state path and daemon-liveness probing are re-implemented in `cli.py`, `mcp.py` and `tui.py`. Target: single `ipc.py` owner.
+- `tui.Renderer` is one 1465-line class. Target: split into draw units behind the same public surface.
+- `myx/player.py` mixes queue policy, mpv IPC, state serialisation and DSP application. Target: extract state serialisation.
+
+## Packaging and releases
+
+- uv project. Deps exactly as declared in the CONTRACT (`numpy`, `pillow`). No others. No added dependency without replacing one.
+- Version lives in `myx/__init__.py`, `pyproject.toml`, `uv.lock`, `Formula/myx.rb`. Sync with `python3 scripts/bump_release.py <version>`; CI runs `--verify`.
+- Tagging `vX.Y.Z` triggers `.github/workflows/release.yml` (PyPI, GitHub Release, Homebrew formula SHA256).
+- External bins checked at boot: mpv, yt-dlp, ffmpeg. Missing -> one-line install hint, exit 1.
+- macOS arm64 + Linux. License MIT.
+
+## Testing
+
+- `uv run pytest` green before any commit. `tests/test_bible.py` must pass: it is the spec check.
+- New behaviour gets a test in the closest existing file; new module gets its own. No network, no real mpv, no real yt-dlp.
 
 ## Maintaining this file
 
-Keep this file for knowledge useful to almost every future agent session in this project.
-Do not repeat what the codebase already shows; point to the authoritative file or command instead.
-Prefer rewriting or pruning existing entries over appending new ones.
-When updating this file, preserve this bar for all agents and keep entries concise.
+Keep this file for knowledge useful to almost every future agent session. Point to the authoritative file or command instead of repeating what the code shows. When code and bible disagree, decide which one is right, then change both in the same commit - and let `tests/test_bible.py` be the thing that catches you if you forget.
