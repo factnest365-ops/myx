@@ -7,9 +7,17 @@ formatting helpers. Stdlib only.
 from __future__ import annotations
 
 import difflib
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
+
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _clean_inline(value: Any) -> str:
+    return _CTRL_RE.sub("", str(value or ""))
+
 
 # ---------------------------------------------------------------------------
 # fuzzy helpers
@@ -32,18 +40,13 @@ def fuzzy_score(query: str, text: str) -> float:
         return 0.0
     if not q:
         return 1.0
-    # base similarity
     ratio = difflib.SequenceMatcher(None, q, t).ratio()
     if q in t:
         ratio = min(1.0, ratio + 0.4)
-        # boost for prefix of a word or full text
         if t.startswith(q):
             ratio = min(1.0, ratio + 0.1)
-        # also boost if q matches start of any word in t
         elif any(w.startswith(q) for w in t.split()):
             ratio = min(1.0, ratio + 0.06)
-    # slight normalization for very short queries so they don't dominate
-    # no penalty — just keep capped
     return max(0.0, min(1.0, ratio))
 
 
@@ -122,11 +125,10 @@ def format_duration(value: Any) -> str:
 
 def format_result_line(item: dict[str, Any], width: int = 48) -> str:
     """Single-line summary for a picker result: 'Title — Artist  m:ss'."""
-    title = str(item.get("title") or "Unknown")[: width - 16]
-    artist = str(item.get("artist") or "")
+    title = (_clean_inline(item.get("title")) or "Unknown")[: max(8, width - 16)]
+    artist = _clean_inline(item.get("artist"))
     dur = format_duration(item.get("duration"))
     if artist:
-        # truncate to keep total roughly within width
         avail = max(8, width - len(title) - len(dur) - 5)
         artist = artist[:avail]
         return f"{title} — {artist}  {dur}"
@@ -151,12 +153,11 @@ class PickerState:
     last_query_time: float = field(default_factory=lambda: 0.0)
 
     def set_query(self, query: str, now: float | None = None) -> None:
-        self.query = query
+        self.query = _clean_inline(query)
         self.selected = 0
         self.error = None
         self.last_query_time = now if now is not None else time.monotonic()
-        # loading will be set by caller when it fires the actual search
-        if not query.strip():
+        if not self.query.strip():
             self.results = []
             self.loading = False
 
@@ -192,7 +193,7 @@ class PickerState:
             self.error = None
 
     def set_error(self, error: str | None) -> None:
-        self.error = error
+        self.error = _clean_inline(error) if error else None
         self.loading = False
 
     def selected_result(self) -> dict[str, Any] | None:
@@ -214,9 +215,31 @@ COMMAND_PALETTE: list[dict[str, str]] = [
     {"id": "pause", "label": "Pause", "keys": "space", "action": "pause"},
     {"id": "next", "label": "Next track", "keys": "n", "action": "skip"},
     {"id": "prev", "label": "Previous track", "keys": "p", "action": "prev"},
+    {"id": "seek_fwd", "label": "Seek forward +5s", "keys": "→", "action": "seek_fwd"},
+    {"id": "seek_back", "label": "Seek backward -5s", "keys": "←", "action": "seek_back"},
+    {"id": "like", "label": "Like / Unlike current song ♥", "keys": "ctrl-l", "action": "like"},
+    {"id": "play_liked", "label": "Play Liked Songs ♥", "keys": "click / lib", "action": "play_liked"},
+    {"id": "cache_track", "label": "Cache current song offline", "keys": "offline", "action": "cache_track"},
+    {"id": "playlist_save", "label": "Save queue to 'Favorites' playlist", "keys": "playlist", "action": "playlist_save"},
+    {"id": "eq_cycle", "label": "Cycle Audiophile EQ / DSP preset", "keys": "ctrl-e", "action": "eq_cycle"},
+    {"id": "eq_bass", "label": "EQ Preset: Bass Boost", "keys": "eq", "action": "eq_bass"},
+    {"id": "eq_vocal", "label": "EQ Preset: Vocal Clarity", "keys": "eq", "action": "eq_vocal"},
+    {"id": "eq_spatial", "label": "EQ Preset: Spatial Crossfeed", "keys": "eq", "action": "eq_spatial"},
+    {"id": "eq_slowed", "label": "DSP Preset: Slowed + Reverb", "keys": "dsp", "action": "eq_slowed"},
+    {"id": "eq_nightcore", "label": "DSP Preset: Nightcore", "keys": "dsp", "action": "eq_nightcore"},
+    {"id": "eq_flat", "label": "EQ Preset: Flat (Bypass)", "keys": "eq", "action": "eq_flat"},
+    {"id": "normalize", "label": "Toggle Loudness Normalization", "keys": "norm", "action": "normalize"},
+    {"id": "crossfade", "label": "Toggle 4s Smart Crossfade", "keys": "xfade", "action": "crossfade"},
+    {"id": "sponsorblock", "label": "Toggle SponsorBlock Auto-Skip", "keys": "ctrl-b", "action": "sponsorblock"},
+    {"id": "next_chapter", "label": "Next YouTube Chapter", "keys": "}", "action": "next_chapter"},
+    {"id": "prev_chapter", "label": "Previous YouTube Chapter", "keys": "{", "action": "prev_chapter"},
+    {"id": "chameleon", "label": "Toggle Dynamic Album-Art Theme", "keys": "ctrl-t", "action": "chameleon"},
     {"id": "shuffle", "label": "Shuffle queue", "keys": "s", "action": "shuffle"},
+    {"id": "loop", "label": "Cycle repeat (off / one / all)", "keys": "ctrl-r", "action": "loop"},
+    {"id": "mute", "label": "Mute / Unmute audio", "keys": "ctrl-g", "action": "mute"},
     {"id": "vol_up", "label": "Volume up", "keys": "+ / =", "action": "vol_up"},
     {"id": "vol_down", "label": "Volume down", "keys": "- ", "action": "vol_down"},
+    {"id": "clear", "label": "Clear upcoming queue", "keys": "clear", "action": "clear"},
     {
         "id": "lyrics",
         "label": "Toggle lyrics view",
@@ -256,17 +279,26 @@ def command_palette_search(query: str) -> list[dict[str, str]]:
 
 KEYBINDS: list[dict[str, str]] = [
     {"keys": "type", "desc": "Type to search — results appear instantly"},
-    {"keys": "/", "desc": "Open search picker"},
-    {"keys": "↑ / ↓  · j / k", "desc": "Navigate list"},
+    {"keys": "/", "desc": "Open search picker (tab enqueues, enter plays)"},
+    {"keys": "↑ / ↓  · j / k", "desc": "Navigate queue or search results"},
+    {"keys": "← / →", "desc": "Seek backward / forward 5 seconds"},
     {"keys": "enter", "desc": "Play selected / confirm"},
     {"keys": "esc", "desc": "Close picker / overlay"},
     {"keys": "space", "desc": "Play / pause"},
-    {"keys": "n / p", "desc": "Next / previous track"},
+    {"keys": "n / p", "desc": "Next / previous track (p restarts if >5s)"},
     {"keys": "+ / -", "desc": "Volume up / down"},
     {"keys": "s", "desc": "Shuffle queue"},
+    {"keys": "ctrl-l", "desc": "Like / unlike current song ♥"},
+    {"keys": "ctrl-e", "desc": "Cycle EQ / DSP preset (Bass, Vocal, Nightcore...)"},
+    {"keys": "ctrl-b", "desc": "Toggle SponsorBlock non-music auto-skip"},
+    {"keys": "ctrl-t", "desc": "Toggle Album-Art Chameleon dynamic theme"},
+    {"keys": "{ / }", "desc": "Previous / next YouTube chapter"},
+    {"keys": "mouse", "desc": "Click progress bar to scrub, click tabs/queue/controls"},
+    {"keys": "ctrl-r", "desc": "Cycle repeat mode (off → one → all)"},
     {"keys": "l / tab", "desc": "Cycle view: Now → Lyrics → Queue"},
+    {"keys": "[ / ]", "desc": "Nudge synced lyrics offset ∓0.5s"},
     {"keys": "d", "desc": "Delete selected (press twice to confirm)"},
-    {"keys": "ctrl-k", "desc": "Command palette"},
+    {"keys": "ctrl-k", "desc": "Command palette (mute, clear, repeat, etc.)"},
     {"keys": "?", "desc": "Help & tour"},
     {"keys": "q", "desc": "Quit"},
 ]
@@ -282,6 +314,6 @@ TOUR_STEPS: list[dict[str, str]] = [
     },
     {
         "title": "Step 3 — Play",
-        "description": "Space pauses, n / p skips, q quits. [▶] [⏸] [⏭] [🔀] controls are always in the footer.",
+        "description": "Space pauses, n / p skips, ← / → seeks ±5s, q quits. [▶] [⏸] [⏭] [🔀] controls are always in the footer.",
     },
 ]
