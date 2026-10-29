@@ -7,7 +7,9 @@ Reuses the existing daemon IPC (CMD_SOCK + STATE_PATH); does not own playback.
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -37,6 +39,20 @@ except Exception:
 
 STATE_PATH = Path(os.environ.get("MYX_STATE", PLAYER_STATE_PATH))
 CMD_SOCK = Path(os.environ.get("MYX_CMD_SOCK", PLAYER_CMD_SOCK))
+MAX_RPC_LINE_BYTES = 1024 * 1024  # 1 MiB cap per JSON-RPC line
+
+
+def _is_trusted_local_path(path: Path) -> bool:
+    """Reject symlinks and files owned by a different local UID."""
+    try:
+        if path.is_symlink():
+            return False
+        if path.exists() and hasattr(os, "getuid"):
+            if path.stat().st_uid != os.getuid():
+                return False
+        return True
+    except OSError:
+        return False
 
 
 def _get_fallback_tmpdirs() -> list[Path]:
@@ -76,9 +92,11 @@ def _candidate_cmd_socks() -> list[Path]:
 def _candidate_mpv_socks() -> list[Path]:
     seen: set[Path] = set()
     out: list[Path] = []
-    for p in [PLAYER_MPV_SOCK, CMD_SOCK, PLAYER_CMD_SOCK] + [
+    mpv_env = os.environ.get("MYX_MPV_SOCK")
+    candidates = ([Path(mpv_env)] if mpv_env else []) + [PLAYER_MPV_SOCK] + [
         d / "myx-mpv.sock" for d in _get_fallback_tmpdirs()
-    ]:
+    ]
+    for p in candidates:
         if p not in seen:
             seen.add(p)
             out.append(p)
@@ -91,17 +109,20 @@ SERVER_VERSION = "0.2.0"
 
 def _send_cmd(cmd: str, **payload: Any) -> dict[str, Any]:
     msg = {"cmd": cmd, **payload}
+    sock_timeout = 22.0 if cmd in ("search", "search_query") else 2.5
     last_err: Exception | None = None
     for sock_path in _candidate_cmd_socks():
+        if not _is_trusted_local_path(sock_path):
+            continue
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
                 s.settimeout(2.0)
                 s.connect(str(sock_path))
-                s.sendall((json.dumps(msg) + "\n").encode())
+                s.sendall((json.dumps(msg) + "\n").encode("utf-8"))
                 data = b""
-                s.settimeout(2.0)
-                while True:
-                    chunk = s.recv(4096)
+                s.settimeout(sock_timeout)
+                while len(data) < 1024 * 1024:
+                    chunk = s.recv(8192)
                     if not chunk:
                         break
                     data += chunk
@@ -123,14 +144,16 @@ def _mpv_direct(command: list[Any]) -> Any:
     msg = {"command": command}
     last_err: Exception | None = None
     for sock_path in _candidate_mpv_socks():
+        if not _is_trusted_local_path(sock_path):
+            continue
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
                 s.settimeout(2.0)
                 s.connect(str(sock_path))
-                s.sendall((json.dumps(msg) + "\n").encode())
+                s.sendall((json.dumps(msg) + "\n").encode("utf-8"))
                 data = b""
                 s.settimeout(2.0)
-                while True:
+                while len(data) < 1024 * 1024:
                     chunk = s.recv(65536)
                     if not chunk:
                         break
@@ -158,15 +181,27 @@ def _url(video_id: str) -> str:
 
 
 def _video_id(value: str | None) -> str | None:
-    if not value:
+    if not value or not isinstance(value, str):
         return None
-    import re
-    for pat in (r"[?&]v=([^&]+)", r"youtu\.be/([^?&/]+)", r"/shorts/([^?&/]+)", r"/embed/([^?&/]+)", r"/live/([^?&/]+)", r"/watch/([^?&/]+)"):
-        m = re.search(pat, value)
+    raw = value.strip()
+    if not raw or any(ord(c) < 0x20 for c in raw):
+        return None
+    for pat in (
+        r"[?&]v=([^&#/?\s]+)",
+        r"youtu\.be/([^?&#/\s]+)",
+        r"/shorts/([^?&#/\s]+)",
+        r"/embed/([^?&#/\s]+)",
+        r"/live/([^?&#/\s]+)",
+        r"/watch/([^?&#/\s]+)",
+    ):
+        m = re.search(pat, raw)
         if m:
-            return m.group(1)
-    if re.fullmatch(r"[A-Za-z0-9_-]{6,}", value):
-        return value
+            candidate = m.group(1)
+            if re.fullmatch(r"[A-Za-z0-9_-]{4,64}", candidate):
+                return candidate
+            return None
+    if re.fullmatch(r"[A-Za-z0-9_-]{6,64}", raw):
+        return raw
     return None
 
 
@@ -183,48 +218,44 @@ def _meta_with_timeout(video_id: str, timeout: float = 2.0) -> dict[str, Any] | 
         except sources.SourcesError:
             res = {}
 
-    t = threading.Thread(target=_run)
+    t = threading.Thread(target=_run, daemon=True)
     t.start()
     t.join(timeout)
     return res
 
 
 def _hydrate_queue(state: dict[str, Any]) -> dict[str, Any]:
-    # Non-blocking: state provided by player daemon already contains metadata from JIT queue
     return state
 
 
 def _read_state() -> dict[str, Any]:
-    for p in _candidate_states():
-        try:
-            lock = p.parent / "myx.lock"
-            cmd_sock = p.parent / "myx-cmd.sock"
-            pid = int(lock.read_text(encoding="utf-8").strip())
-            os.kill(pid, 0)
-            if p.exists() and _daemon_reachable(cmd_sock):
-                state = json.loads(p.read_text(encoding="utf-8"))
-                if isinstance(state, dict):
-                    return _hydrate_queue(state)
-                return {
-                    "playing": False,
-                    "paused": True,
-                    "title": None,
-                    "artist": None,
-                    "queue": [],
-                }
-        except (OSError, ValueError, TypeError):
-            continue
-    return {
+    empty = {
         "playing": False,
         "paused": True,
         "title": None,
         "artist": None,
         "queue": [],
     }
+    for p in _candidate_states():
+        try:
+            lock = p.parent / "myx.lock"
+            cmd_sock = p.parent / "myx-cmd.sock"
+            if not _is_trusted_local_path(p) or not _is_trusted_local_path(lock):
+                continue
+            pid = int(lock.read_text(encoding="utf-8").strip())
+            os.kill(pid, 0)
+            if p.exists() and _daemon_reachable(cmd_sock):
+                state = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(state, dict):
+                    return _hydrate_queue(state)
+                return empty
+        except (OSError, ValueError, TypeError):
+            continue
+    return empty
 
 
 def _daemon_reachable(cmd_sock: Path) -> bool:
-    if not cmd_sock.exists():
+    if not cmd_sock.exists() or not _is_trusted_local_path(cmd_sock):
         return False
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -279,7 +310,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "myx_state",
-        "description": "Get current player state: playing/paused, title/artist, position/duration, volume, queue, lyrics (lrc/plain). Pollable at 4Hz.",
+        "description": "Get current player state: playing/paused, title/artist, position/duration, volume, muted, loop, queue, lyrics (lrc/plain). Pollable at 4Hz.",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     {
@@ -294,7 +325,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "myx_prev",
-        "description": "Go to previous track (playlist-prev).",
+        "description": "Go to previous track (or restart current if >5s in).",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     {
@@ -313,6 +344,17 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     {
+        "name": "myx_seek",
+        "description": "Seek within current track. Provide 'delta' (±seconds relative) or 'position' (seconds from 0).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "delta": {"type": "number", "description": "Relative seek in seconds, e.g. 10 or -5"},
+                "position": {"type": "number", "description": "Absolute position in seconds, e.g. 60"},
+            },
+        },
+    },
+    {
         "name": "myx_volume",
         "description": "Set or adjust volume. If 'volume' is 0..100, sets absolute. If 'delta' is provided (±5 typical), adjusts relative.",
         "inputSchema": {
@@ -327,8 +369,37 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "myx_mute",
+        "description": "Toggle mute or set explicit muted boolean.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "muted": {"type": "boolean", "description": "Optional explicit mute state"}
+            },
+        },
+    },
+    {
+        "name": "myx_loop",
+        "description": "Set or cycle repeat mode ('off', 'one', 'all').",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["off", "one", "all"],
+                    "description": "Repeat mode; omit to cycle",
+                }
+            },
+        },
+    },
+    {
         "name": "myx_shuffle",
         "description": "Shuffle the queue.",
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "myx_clear",
+        "description": "Clear upcoming tracks from the queue.",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     {
@@ -354,6 +425,101 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {"index": {"type": "integer"}},
             "required": ["index"],
+        },
+    },
+    {
+        "name": "myx_eq",
+        "description": "Set or cycle audiophile EQ/DSP preset (flat, bass_boost, vocal, treble_sparkle, rock, electronic, late_night, spatial, slowed_reverb, nightcore) or custom 5-band dB gains.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "preset": {"type": "string", "description": "Preset name or 'cycle'"},
+                "bands": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": "Optional 5-band dB gains [-12..+12] at [60, 230, 910, 3600, 14000] Hz",
+                },
+            },
+        },
+    },
+    {
+        "name": "myx_dsp",
+        "description": "Configure loudness normalization, smart crossfade (0..12s), silence trimming, or SponsorBlock non-music auto-skip.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "normalize": {"type": "boolean", "description": "Enable/disable dynamic loudness normalization"},
+                "crossfade_s": {"type": "number", "description": "Crossfade duration in seconds (0..12)"},
+                "trim_silence": {"type": "boolean", "description": "Enable/disable silence trimming"},
+                "sponsorblock": {"type": "boolean", "description": "Enable/disable SponsorBlock non-music auto-skip"},
+            },
+        },
+    },
+    {
+        "name": "myx_like",
+        "description": "Like/unlike songs or list/play Liked Songs from the persistent SQLite library.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["toggle", "list", "play"],
+                    "description": "Default 'toggle' likes/unlikes current track; 'list' returns liked songs; 'play' loads liked songs into queue",
+                },
+                "liked": {"type": "boolean", "description": "Explicit like state when action='toggle'"},
+            },
+        },
+    },
+    {
+        "name": "myx_playlist",
+        "description": "Manage persistent playlists or import YouTube/M3U playlists (actions: list, save, load, add, delete, import, export).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "save", "load", "add", "delete", "import", "export"],
+                },
+                "name": {"type": "string", "description": "Playlist name"},
+                "url": {"type": "string", "description": "YouTube/YT Music playlist URL or ID (for action='import')"},
+                "m3u": {"type": "string", "description": "M3U playlist text (for action='import')"},
+                "replace": {"type": "boolean", "description": "Replace current playback when loading/importing"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "myx_chapter",
+        "description": "Navigate YouTube chapters on the current track ('next', 'prev', or 'list').",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["next", "prev", "list"],
+                    "description": "Navigate to next/prev chapter or list chapters",
+                }
+            },
+        },
+    },
+    {
+        "name": "myx_history",
+        "description": "Get recent listening history and most-played tracks from the persistent SQLite library.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Max entries (1..100, default 25)"}
+            },
+        },
+    },
+    {
+        "name": "myx_cache_track",
+        "description": "Download and cache the current track (or video ID) as local Opus/M4A for instant offline playback.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Optional YouTube video ID or URL; defaults to current track"}
+            },
         },
     },
 ]
@@ -539,6 +705,19 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         elif name == "myx_toggle":
             return _tool_result(_send_cmd("toggle"))
 
+        elif name == "myx_seek":
+            if "position" in args and args["position"] is not None:
+                pos = float(args["position"])
+                if not math.isfinite(pos):
+                    return _tool_error("position must be finite")
+                return _tool_result(_send_cmd("jump", arg=pos))
+            if "delta" in args and args["delta"] is not None:
+                delta = float(args["delta"])
+                if not math.isfinite(delta):
+                    return _tool_error("delta must be finite")
+                return _tool_result(_send_cmd("seek", arg=delta))
+            return _tool_error("provide delta (±seconds) or position (seconds)")
+
         elif name == "myx_volume":
             if "delta" in args and args["delta"] is not None:
                 return _tool_result(_send_cmd("vol", value=int(args["delta"])))
@@ -546,8 +725,24 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 return _tool_result(_send_cmd("vol", arg=int(args["volume"])))
             return _tool_error("provide volume (0..100) or delta (±N)")
 
+        elif name == "myx_mute":
+            if "muted" in args and isinstance(args["muted"], bool):
+                return _tool_result(_send_cmd("mute", arg=args["muted"]))
+            return _tool_result(_send_cmd("mute"))
+
+        elif name == "myx_loop":
+            mode = args.get("mode")
+            if mode is not None:
+                if mode not in ("off", "one", "all"):
+                    return _tool_error("mode must be 'off', 'one', or 'all'")
+                return _tool_result(_send_cmd("loop", arg=mode))
+            return _tool_result(_send_cmd("loop"))
+
         elif name == "myx_shuffle":
             return _tool_result(_send_cmd("shuffle"))
+
+        elif name == "myx_clear":
+            return _tool_result(_send_cmd("clear"))
 
         elif name == "myx_lyrics":
             st = _read_state()
@@ -567,6 +762,83 @@ def handle_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         elif name == "myx_play_index":
             idx = int(args.get("index", 0))
             return _tool_result(_send_cmd("play_index", arg=idx))
+
+        elif name == "myx_eq":
+            payload: dict[str, Any] = {}
+            if "bands" in args and isinstance(args["bands"], list):
+                payload["bands"] = args["bands"]
+            preset = args.get("preset")
+            return _tool_result(_send_cmd("eq", arg=preset, **payload))
+
+        elif name == "myx_dsp":
+            results: dict[str, Any] = {}
+            if "normalize" in args:
+                results["normalize"] = _send_cmd("normalize", arg=bool(args["normalize"]))
+            if "crossfade_s" in args:
+                results["crossfade"] = _send_cmd("crossfade", arg=float(args["crossfade_s"]))
+            if "trim_silence" in args:
+                results["trim_silence"] = _send_cmd(
+                    "trim_silence", arg=bool(args["trim_silence"])
+                )
+            if "sponsorblock" in args:
+                results["sponsorblock"] = _send_cmd(
+                    "sponsorblock", arg=bool(args["sponsorblock"])
+                )
+            if not results:
+                st = _read_state()
+                return _tool_result(
+                    {"dsp": st.get("dsp"), "sponsorblock": st.get("sponsorblock")}
+                )
+            return _tool_result({"ok": True, **results})
+
+        elif name == "myx_like":
+            action = str(args.get("action") or "toggle").lower()
+            if action == "list":
+                return _tool_result(_send_cmd("liked_list"))
+            if action == "play":
+                return _tool_result(_send_cmd("play_liked"))
+            extra = {"liked": args["liked"]} if isinstance(args.get("liked"), bool) else {}
+            return _tool_result(_send_cmd("like", **extra))
+
+        elif name == "myx_playlist":
+            action = str(args.get("action") or "list").lower()
+            cmd_map = {
+                "list": "playlist_list",
+                "save": "playlist_save",
+                "load": "playlist_load",
+                "add": "playlist_add",
+                "delete": "playlist_delete",
+                "import": "playlist_import",
+                "export": "playlist_export",
+            }
+            if action not in cmd_map:
+                return _tool_error(f"invalid playlist action: {action}")
+            kw: dict[str, Any] = {}
+            for k in ("name", "url", "m3u", "replace"):
+                if k in args and args[k] is not None:
+                    kw[k] = args[k]
+            return _tool_result(_send_cmd(cmd_map[action], **kw))
+
+        elif name == "myx_chapter":
+            action = str(args.get("action") or "list").lower()
+            if action == "next":
+                return _tool_result(_send_cmd("next_chapter"))
+            if action == "prev":
+                return _tool_result(_send_cmd("prev_chapter"))
+            st = _read_state()
+            return _tool_result(
+                {
+                    "chapter": st.get("chapter"),
+                    "chapters": st.get("chapters") or [],
+                }
+            )
+
+        elif name == "myx_history":
+            limit = int(args.get("limit") or 25)
+            return _tool_result(_send_cmd("history", limit=limit))
+
+        elif name == "myx_cache_track":
+            return _tool_result(_send_cmd("cache_track", arg=args.get("id")))
 
         else:
             return _tool_error(f"unknown tool: {name}")
@@ -637,7 +909,6 @@ def _dispatch(msg: Any) -> dict[str, Any] | None:
         if method == "shutdown":
             resp = _rpc_reply(mid, {})
             return None if notification else resp
-        # Unknown method: -32601; notifications stay unanswered.
         if notification:
             return None
         return _rpc_error(mid, -32601, f"Method not found: {method}")
@@ -655,6 +926,9 @@ def serve_stdio() -> int:
     (-32600), and notifications (never answered).
     """
     for raw in sys.stdin:
+        if len(raw) > MAX_RPC_LINE_BYTES:
+            _write(_rpc_error(None, -32600, "Request too large"))
+            continue
         line = raw.strip()
         if not line:
             continue

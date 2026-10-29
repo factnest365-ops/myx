@@ -15,8 +15,19 @@ err()   { printf "${RED}  ✗ %s${RESET}\n" "$*"; }
 
 has() { command -v "$1" >/dev/null 2>&1; }
 
+prompt_tty() {
+  local default_val="$1"
+  local ans=""
+  if [[ -t 0 ]]; then
+    read -r ans || ans=""
+  elif [[ -r /dev/tty ]]; then
+    read -r ans </dev/tty || ans=""
+  fi
+  printf "%s" "${ans:-$default_val}"
+}
+
 # Detect repo root if running from checkout
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd || echo "")"
 
 printf "\n${BOLD}myx installer${RESET} ${DIM}— terminal music for YouTube/YT Music${RESET}\n\n"
@@ -48,7 +59,8 @@ if (( ${#need_bins[@]} > 0 )); then
   info "Missing bins: ${need_bins[*]}"
   if has brew; then
     printf "  Install with Homebrew? [Y/n] "
-    read -r ans; ans="${ans:-Y}"
+    ans="$(prompt_tty "Y")"
+    echo ""
     if [[ "$ans" =~ ^[Yy] ]]; then
       brew install "${need_bins[@]}"
       ok "Installed via brew"
@@ -59,10 +71,10 @@ if (( ${#need_bins[@]} > 0 )); then
     echo "  Try: sudo apt-get update && sudo apt-get install -y mpv ffmpeg"
     echo "       pipx install yt-dlp  # yt-dlp is rarely in apt"
     printf "  Run apt install now? [y/N] "
-    read -r ans; ans="${ans:-N}"
+    ans="$(prompt_tty "N")"
+    echo ""
     if [[ "$ans" =~ ^[Yy] ]]; then
       sudo apt-get update
-      # only apt-install what apt knows; yt-dlp via pipx
       apt_pkgs=(); pipx_pkgs=()
       for b in "${need_bins[@]}"; do
         if [[ "$b" == "yt-dlp" ]]; then pipx_pkgs+=("$b"); else apt_pkgs+=("$b"); fi
@@ -86,7 +98,7 @@ info "Installing myx (Python package)..."
 
 install_myx() {
   local from_source=0
-  if [[ -f "$REPO_ROOT/pyproject.toml" ]] && grep -q 'name = "myx"' "$REPO_ROOT/pyproject.toml" 2>/dev/null; then
+  if [[ -n "$REPO_ROOT" ]] && [[ -f "$REPO_ROOT/pyproject.toml" ]] && grep -q 'name = "myx"' "$REPO_ROOT/pyproject.toml" 2>/dev/null; then
     from_source=1
   fi
 

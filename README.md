@@ -83,22 +83,41 @@ Player refills forever via the RD mix chain: deduped `seen` set, eager first fil
 | key | action |
 |---|---|
 | `space` | pause / resume |
-| `n` / `p` | next / prev |
-| `/` | search (type query, enter) |
+| `n` / `p` | next / prev (`p` restarts track if >5 s, else previous in history) |
+| `←` / `→` | seek ∓5 s |
+| `/` (or just type) | search picker (`enter` plays, `tab` adds to queue) |
 | `s` | shuffle |
+| `ctrl-l` | like / unlike current song `♥` |
+| `ctrl-e` | cycle Audiophile EQ / DSP preset (`Bass Boost`, `Vocal`, `Spatial`, `Slowed + Reverb`, `Nightcore`, ...) |
+| `ctrl-b` | toggle SponsorBlock non-music auto-skip |
+| `ctrl-t` | toggle Chameleon dynamic album-art palette |
+| `{` / `}` | previous / next YouTube chapter |
+| `ctrl-r` | cycle repeat (`off` → `one` → `all`) |
+| `ctrl-g` | mute / unmute |
+| `ctrl-k` | command palette |
 | `+/-` (`=`) | volume ±5 |
 | `l` / `tab` | cycle view: Now Playing → Lyrics → Queue |
-| `j` / `k` (arrows) | move selection in queue |
+| `j` / `k` (arrows, PgUp/PgDn, mouse wheel) | move selection in queue |
+| `mouse click` | scrub progress bar, switch tabs, play Liked Songs `♥`, trigger transport buttons |
 | `enter` | play selected queue entry |
-| `d` | delete selected queue entry |
-| `[` / `]` | nudge lyrics offset ∓0.5 s |
+| `d` | delete selected queue entry (press twice to confirm) |
+| `[` / `]` | nudge lyrics offset ∓0.5 s (persisted per track in SQLite) |
+| `?` | help & tour |
 | `q` | quit |
 
 ## Views
 
-- **Now Playing** — album art (kitty → iterm2 → half-block), title/artist, `m:ss ──o── m:ss` bar, 24-bar spectrum.
-- **Lyrics** — centered plain or synced LRC (current line highlighted, auto-follows).
-- **Queue** — full-screen queue with durations; selection highlighted.
+- **Now Playing** — album art (kitty/Ghostty → iTerm2/WezTerm → Pillow Lanczos half-block), Chameleon album-art accent palette, live `♥` badge, chapter-marked `m:ss ──┼──o── m:ss` bar (`§ Chapter`), DSP/EQ/offline status badges, 24-bar Hann/Mel spectrum.
+- **Lyrics** — centered plain or synced LRC (current line highlighted, per-track offset persisted in SQLite).
+- **Queue** — sidebar + full-screen queue with durations, `▸ Play Liked Songs ♥ (N)`, and scroll viewport.
+
+## Audiophile DSP, Library & Interactive Features
+
+- **Audiophile DSP Engine (`myx/dsp.py`)**: 10 live `mpv` `lavfi` presets (`flat`, `bass_boost`, `vocal`, `treble_sparkle`, `rock`, `electronic`, `late_night`, `spatial`, `slowed_reverb`, `nightcore`), custom 5-band parametric EQ (`[60, 230, 910, 3600, 14000] Hz`), `dynaudnorm` loudness normalization, silence trimming, gapless playback (`--gapless-audio=yes`), and smart crossfade (`--crossfade 4`).
+- **SponsorBlock Auto-Skip**: Automatically skips non-music intros/skits/outros via keyless `sponsor.ajay.app` lookups (`ctrl-b` or `--sponsorblock`).
+- **Persistent SQLite Library & Offline Cache (`myx/library.py`)**: WAL-mode `sqlite3` database storing `♥` Liked Songs (`--like` / `--liked`), custom playlists, YouTube & `.m3u` playlist import/export (`--import-playlist`), play history / most played, per-track lyrics sync offsets, and local Opus/M4A offline audio cache (`--cache-track`) with LRU budget eviction.
+- **Synced Zero-Bandwidth Spectrum**: `FfmpegTapSource` reads local cached Opus/M4A files first (zero extra network bandwidth), seeks to `-ss <position>`, freezes/resumes with `SIGSTOP`/`SIGCONT` on pause, auto-resyncs on scrub seeks, and computes 16 kHz Hann-windowed perceptual Mel/log-frequency bars.
+- **Chameleon Theme & SGR 1006 Mouse**: Extracts WCAG-safe dominant + secondary accents from album art via Pillow (`ctrl-t` to toggle) and supports full SGR mouse click-to-scrub on the progress bar, tab/queue/heart clicking, and wheel scrolling.
 
 ## Art
 
@@ -129,18 +148,20 @@ err = "#ff4444"
 - `myx/sources.py` — pure functions over `yt-dlp` JSON + `lrclib` (`search`, `mix_chain`, `meta`, `cache_thumb`, `lyrics`; 20 s timeout; `SourcesError`).
 - `myx/player.py` — `PlayerDaemon` (`python -m myx.player <url>`): manages playback via `mpv --input-ipc-server=$TMPDIR/myx-mpv.sock --idle=yes --no-video --no-ytdl`, maintains a JIT 2-track buffer in MPV (Track 0 playing, Track 1 pre-resolved next; remaining items held in memory as metadata with on-demand stream resolution), non-blocking IPC commands (`play_id`, `load`, `search`), background radio refill via mix chain, non-blocking thumbnail and lyrics resolution, atomic `$TMPDIR/myx-state.json` at ≥ 4 Hz, and command server on `$TMPDIR/myx-cmd.sock` (JSON per line).
 - `myx/tui.py` — alt-screen 12 fps renderer: reads state file, writes command socket, owns zero playback logic.
-- `myx/mcp.py` — stdio MCP server (JSON-RPC 2.0, no deps): exposes 15 tools over stdio by wrapping the same daemon IPC + `myx-state.json`. Agent-native, TUI-optional.
-- `myx/cli.py` — entrypoint, single-instance lockfile, bin checks, `--search` / `--lyrics-only`, headless controls (`--quit`, `--skip`, `--prev`, `--toggle`, `--vol`), `--no-lyrics`, plus agent-friendly `myx --state` and `myx mcp`.
+- `myx/dsp.py` — Audiophile DSP config, 10 `lavfi` EQ/speed/pitch presets, 5-band parametric EQ, `dynaudnorm`, silence trimming, and smart crossfade gain curves.
+- `myx/library.py` — Thread-safe `sqlite3` WAL store (`0o700` dir / `0o600` db) for tracks, `♥` likes, playlists, M3U import/export, play history, per-track lyrics sync offsets, and offline Opus/M4A cache LRU eviction.
+- `myx/mcp.py` — stdio MCP server (JSON-RPC 2.0, no deps): exposes 26 tools over stdio by wrapping the same daemon IPC + `myx-state.json`. Agent-native, TUI-optional.
+- `myx/cli.py` — entrypoint, single-instance lockfile, bin checks, `--search` / `--lyrics-only`, headless controls (`--quit`, `--skip`, `--prev`, `--toggle`, `--vol`, `--seek`, `--jump`, `--mute`, `--loop`, `--clear`, `--like`, `--liked`, `--eq`, `--normalize`, `--crossfade`, `--sponsorblock`, `--import-playlist`, `--cache-track`), `--no-lyrics`, plus agent-friendly `myx --state` and `myx mcp`.
 
 ## Agent-native (MCP)
 
 MYX is built agent-first: the TUI is a view, the daemon is the API. Agents don't need the TUI at all.
 
 ```sh
-myx --state              # pollable JSON — title/artist/position/queue/lyrics
+myx --state              # pollable JSON — title/artist/position/queue/lyrics/dsp/chapters
 myx --no-lyrics URL      # skip lyrics fetching in headless or agent mode
-myx --skip               # headless playback controls also include --quit, --prev, --toggle, --vol N
-myx mcp --stdio          # stdio MCP server — 15 tools
+myx --skip               # headless controls: --quit, --prev, --toggle, --vol N, --like, --liked, --eq bass_boost
+myx mcp --stdio          # stdio MCP server — 26 tools
 myx "https://..."        # still works headless — mpv + yt-dlp, no TUI needed
 ```
 
@@ -154,7 +175,7 @@ Add to `~/.jcode/mcp.json` (jcode already has MYX installed):
 
 Skill is at `~/.jcode/skills/myx/SKILL.md` — auto-loaded. Any jcode agent can then call `myx_search`, `myx_play`, `myx_state`, etc. Also `myx-skill/SKILL.md` in the MYX repo for sharing.
 
-**MCP tools:** `myx_play(url|query)` · `myx_queue_add(url|query)` · `myx_search(query)` · `myx_state` · `myx_queue` · `myx_skip`/`myx_prev` · `myx_pause`/`myx_resume`/`myx_toggle` · `myx_volume(volume|delta)` · `myx_shuffle` · `myx_lyrics` · `myx_remove(index)` · `myx_play_index(index)` — all backed by the daemon's `myx-cmd.sock` + `myx-state.json`; none touch the TUI.
+**MCP tools (26):** `myx_play(url|query)` · `myx_queue_add(url|query)` · `myx_search(query)` · `myx_state` · `myx_queue` · `myx_skip`/`myx_prev` · `myx_pause`/`myx_resume`/`myx_toggle` · `myx_seek(delta|position)` · `myx_volume(volume|delta)` · `myx_mute` · `myx_loop` · `myx_shuffle` · `myx_clear` · `myx_lyrics` · `myx_remove(index)` · `myx_play_index(index)` · `myx_eq(preset|bands)` · `myx_dsp(normalize|crossfade_s|trim_silence|sponsorblock)` · `myx_like(action)` · `myx_playlist(action|name|url|m3u)` · `myx_chapter(action)` · `myx_history(limit)` · `myx_cache_track(id)` — all backed by the daemon's `myx-cmd.sock` + `myx-state.json`; none touch the TUI.
 
 ## Security & Threat Model
 
