@@ -712,8 +712,11 @@ def main(argv: list[str] | None = None) -> int:
         renderer.view = "lyrics"
         renderer.render_once()
         return 0
+    # No-argument launch opens For You. A seed URL or --search means the user
+    # already said what they want, so we go straight to the player instead.
+    open_home = not args.url and not args.search
     try:
-        return tui.run()
+        return tui.run(show_home=open_home)
     finally:
         cleanup(proc)
 

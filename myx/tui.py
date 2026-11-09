@@ -27,6 +27,28 @@ from pathlib import Path
 from tempfile import gettempdir
 from typing import IO, Any
 
+from .design import metrics as layout_metrics
+from .home import Shelf, Track
+from .mouse import (
+    DISABLE_MOUSE,
+    ENABLE_MOUSE,
+    DragTracker,
+    InteractiveMap,
+    MouseButton,
+    MouseEvent,
+    MouseKind,
+    Rect,
+    parse_mouse,
+)
+from .surface import (
+    HomeView,
+    SearchBar,
+    SearchSuggestion,
+    SurfaceActions,
+    SurfaceDrawer,
+    attach_view,
+)
+
 try:  # numpy is allowed for the spectrum tap.
     import numpy as np
 except Exception:  # pragma: no cover - exercised only without project deps
@@ -57,6 +79,7 @@ except Exception:  # fallback for hermetic env without package install
 STATE_PATH = Path(os.environ.get("MYX_STATE", Path(gettempdir()) / "myx-state.json"))
 CMD_SOCK = Path(os.environ.get("MYX_CMD_SOCK", Path(gettempdir()) / "myx-cmd.sock"))
 FOOTER = "type to search · ? help · q quit · space pause · n next · p prev · s shuffle · +,- vol · l lyrics · enter play"
+HOME_FOOTER = "↵ play · f like · / search · ↑↓ move · ? help · q quit"
 CONTROLS_HINT = "[ ▶ Play ] [ ⏸ Pause ] [ ⏭ Next ] [ 🔀 Shuffle ]"
 AUTO_HINT = (
     "♪  Search to add songs  ·  Updating player... run myx doctor if this persists"
@@ -418,6 +441,14 @@ def read_state(path: Path = STATE_PATH) -> dict[str, Any]:
 
 
 def send_command(cmd: str, **payload: Any) -> dict[str, Any]:
+    """Talk to the daemon over its unix socket.
+
+    Raises `OSError` when the daemon is absent, refuses the connection, or does
+    not answer in time (`socket.timeout` is an `OSError`), and `ValueError` when
+    the reply is not valid utf-8 or JSON. Callers catch exactly that pair, so a
+    real bug in the render path still surfaces instead of becoming a silent
+    no-op that leaves the screen frozen with nothing on screen to explain it.
+    """
     message = {"cmd": cmd, **payload}
     sock_timeout = 22.0 if cmd in ("search", "search_query") else 2.5
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -464,6 +495,12 @@ def _terminate_proc(proc: Any) -> None:
                     wait_fn(timeout=0.2)
                 except Exception:
                     pass
+
+
+# The complete failure surface of `send_command`. Naming it keeps the TUI honest:
+# an unreachable daemon becomes a toast, while a genuine bug still propagates
+# instead of being flattened into a silent no-op on a screen that has gone dead.
+DAEMON_UNREACHABLE = (OSError, ValueError)
 
 
 @dataclass
@@ -983,6 +1020,19 @@ class Renderer:
     spectrum_auto: bool = False
     async_search: bool = False
     _spectrum_key: Any = None
+    # --- For You app surface ---
+    home: HomeView = field(default_factory=HomeView)
+    search_bar: SearchBar = field(default_factory=SearchBar)
+    interactive: InteractiveMap = field(default_factory=InteractiveMap)
+    drag: DragTracker = field(default_factory=DragTracker)
+    # A bare `myx` (no seed, nothing playing) opens For You instead of an
+    # empty now-playing panel.
+    show_home: bool = False
+    # Recomputed each home frame; see SurfaceDrawer.audit().
+    affordances: Any = None
+    # Playback position of the last rendered frame, so a directly-invoked seek
+    # action has a real value to work from rather than inventing one.
+    _last_position: float = 0.0
     _last_size: tuple[int, int] | None = None
     # --- app-like picker state ---
     overlay: str | None = None  # None | "search" | "command" | "help"
@@ -1055,6 +1105,376 @@ class Renderer:
         idle_titles = {"MYX", "Waiting for player", "State unavailable", "Unknown", ""}
         return (not queue and not playing) or title in idle_titles and not queue
 
+    # -- For You app surface --
+    def surface_actions(self) -> SurfaceActions:
+        """The callbacks the surface drawer is allowed to invoke.
+
+        Every one of these has a real effect, which is what lets the drawer
+        refuse to draw anything it cannot wire.
+        """
+        return SurfaceActions(
+            focus_search=self._focus_search,
+            submit_search=self._submit_search,
+            play=self._play_track,
+            open_artist=self._open_artist,
+            open_shelf=self._open_shelf,
+            toggle_favourite=self._toggle_favourite,
+            pick_suggestion=self._pick_suggestion,
+        )
+
+    def surface(self) -> SurfaceDrawer:
+        """The drawer bound to this renderer's live hit map."""
+        drawer = SurfaceDrawer(self.surface_actions(), interactive=self.interactive)
+        attach_view(drawer, self.home)
+        return drawer
+
+    def load_library(self, path: Path | None = None) -> None:
+        """Load the persisted library into the home view."""
+        from .home import Library as _Library
+
+        self.home.library = _Library.load(path)
+
+    def save_library(self, path: Path | None = None) -> None:
+        self.home.library.save(path)
+
+    def render_home(
+        self, put: Any, state: dict[str, Any], cols: int, rows: int
+    ) -> None:
+        """Draw the For You home screen: search bar on top, shelves below."""
+        m = layout_metrics(cols, rows)
+        self.interactive.clear()
+        drawer = self.surface()
+        # Refresh shelves from the live library, then draw. `refresh` keeps the
+        # selection valid, so a play that adds history cannot strand a cursor.
+        self.home.refresh()
+        attach_view(drawer, self.home)
+
+        drawer.draw_search_bar(put, self.search_bar, m, 0)
+
+        suggestions = self._suggestions()
+        body_top = 1
+        if suggestions:
+            drawer.draw_suggestions(
+                put, suggestions, m, body_top, max(0, min(4, rows - 4))
+            )
+            body_top += min(4, len(suggestions))
+
+        drawer.draw_home(
+            put, self.home, m, body_top + 1, max(0, rows - body_top - 3)
+        )
+        self.affordances = drawer.audit()
+        if self.affordances.dead:
+            # A dead affordance is a defect, not a cosmetic problem; surface it
+            # rather than letting the user discover it by clicking.
+            self.toast = self.affordances.summary()
+
+        if self.home.has_more_below:
+            more = f"▼ {len(self.home.dropped_shelf_ids)} more — scroll"
+            put(
+                rows - 2,
+                m.gutter,
+                fg("dim") + crop(more, max(0, cols - 2 * m.gutter)) + RESET,
+            )
+
+    def _suggestions(self) -> list[SearchSuggestion]:
+        """Recent queries as suggestions while the bar is focused and empty."""
+        if not self.search_bar.focused or not self.search_bar.is_empty:
+            return []
+        return [
+            SearchSuggestion(text=q, kind="recent", id=q)
+            for q in self.home.library.recent_queries[:4]
+        ]
+
+    # -- surface action implementations --
+    def _focus_search(self) -> None:
+        self.search_bar.focus()
+        self.overlay = None
+
+    def _submit_search(self, query: str) -> None:
+        q = str(query or "").strip()
+        if not q:
+            return
+        self.home.library.record_query(q)
+        # Leave the home surface: the search overlay is drawn by the player
+        # layout, and the home branch of render_once() returns before overlays
+        # are composited. Staying put left the user pressing Enter into an
+        # apparently inert screen with no results anywhere.
+        self.show_home = False
+        self.view = "queue"
+        self.picker.set_query(q, now=time.monotonic())
+        self.open_search(q)
+        self._last_search_fire = 0.0
+        self._maybe_fire_search(now=time.monotonic() + 1.0)
+
+    def _play_track(self, track: Track) -> None:
+        """Play whatever a home card represents."""
+        if track.kind == "station":
+            self._play_station(track)
+            return
+        if track.kind == "artist":
+            self._open_artist(track)
+            return
+        if not track.id:
+            return
+        try:
+            send_command("play_id", arg=track.id)
+            self.home.library.record_play(track.id, track.title, track.artist)
+            self.save_library()
+            self.show_home = False
+            self.view = "now"
+            self.toast = f"Playing {track.title}"
+        except DAEMON_UNREACHABLE as exc:
+            self.toast = str(exc)
+
+    def _play_station(self, track: Track) -> None:
+        query = (track.query or track.title).strip()
+        if not query:
+            return
+        try:
+            send_command("search", arg=query)
+            self.home.library.record_query(query)
+            self.save_library()
+            self.show_home = False
+            self.view = "now"
+            self.toast = f"Playing {track.title}"
+        except DAEMON_UNREACHABLE as exc:
+            self.toast = str(exc)
+
+    def _open_artist(self, track: Track) -> None:
+        query = (track.query or track.title).strip()
+        if not query:
+            return
+        self._submit_search(query)
+
+    def _open_shelf(self, shelf: Shelf) -> None:
+        """A chevron means 'open this section', so it filters the library."""
+        if shelf.id == "stations":
+            self.show_home = False
+            self.view = "now"
+            self.toast = "Pick a station on For You"
+            return
+        self._submit_search(shelf.title)
+
+    def _toggle_favourite(self, track: Track) -> None:
+        if not track.id:
+            return
+        liked = self.home.library.toggle_favourite(track.id)
+        self.save_library()
+        self.toast = (
+            f"Liked {track.title}" if liked else f"Removed {track.title}"
+        )
+
+    def _pick_suggestion(self, suggestion: SearchSuggestion) -> None:
+        self.search_bar.query = suggestion.text
+        self._submit_search(suggestion.text)
+
+    # -- mouse --
+    def handle_mouse(self, event: MouseEvent) -> bool:
+        """Route one decoded mouse event. Returns False to quit.
+
+        The home surface's `InteractiveMap` regions resolve first. A press
+        that matches no region falls through to the now-playing view's bespoke
+        hitboxes (tabs, transport, queue rows) and overlays, so neither
+        surface loses its clicks. Wheel scrolls the home shelves at home and
+        the overlays/queue elsewhere; drag continues a seek gesture.
+        """
+        if event.kind == MouseKind.WHEEL_UP:
+            self._wheel(-1, event.x)
+            return True
+        if event.kind == MouseKind.WHEEL_DOWN:
+            self._wheel(1, event.x)
+            return True
+        if event.kind == MouseKind.PRESS:
+            region = self.interactive.at(event.x, event.y)
+            if region is None:
+                # A seek bar is the one control where clicking past its end
+                # should still count as seeking to the end — otherwise a click
+                # near the right edge on a wide terminal does nothing, which is
+                # exactly the kind of dead spot this build is meant to remove.
+                seek_region = self.interactive.get("seek:main")
+                if seek_region is not None and event.y in range(
+                    seek_region.rect.y, seek_region.rect.y + seek_region.rect.h
+                ):
+                    region = seek_region
+                    event = MouseEvent(
+                        seek_region.rect.x + seek_region.rect.w,
+                        event.y,
+                        event.kind,
+                        event.button,
+                    )
+            if region is not None:
+                self.drag.press(region.id, event.x, event.y)
+                if region.id.startswith("seek:"):
+                    # Seeks are continuous, so they also fire on every drag below.
+                    self._seek_to(region.rect, event.x)
+                    return True
+                # Everything else acts on press, not release: a control should
+                # respond the instant it is clicked rather than making the user
+                # release carefully to avoid a missed click.
+                if region.action:
+                    region.action(*region.args)
+                return True
+            # The bespoke now-playing/overlay boxes below are left-button only.
+            if event.button != MouseButton.LEFT:
+                return True
+            try:
+                self._now_playing_hitbox(event.x, event.y)
+            except Exception as exc:
+                self.toast = sanitize_untrusted(exc)
+            return True
+        if event.kind == MouseKind.DRAG:
+            if self.drag.active:
+                self.drag.drag(event.x, event.y)
+                region = self.interactive.get(self.drag.region_id or "")
+                if region is not None and region.id.startswith("seek:"):
+                    self._seek_to(region.rect, event.x)
+            return True
+        if event.kind == MouseKind.RELEASE:
+            # Release only ends the gesture; the press already acted.
+            self.drag.release(event.x, event.y)
+            return True
+        return True
+
+    def _wheel(self, delta: int, x: int) -> None:
+        """Wheel scroll: home shelves at home, overlays/queue elsewhere."""
+        if self.show_home:
+            self._scroll_home(-2 if delta < 0 else 2)
+            return
+        if self.overlay == "search":
+            self.picker.move(delta)
+        elif self.overlay == "command":
+            filtered = command_palette_search(self.command_query)
+            self.command_selected = max(
+                0, min(max(0, len(filtered) - 1), self.command_selected + delta)
+            )
+        elif self.view == "lyrics" and x > self._left_w:
+            self.lyrics.offset = round(self.lyrics.offset - delta * 0.5, 2)
+            try:
+                send_command("lyrics_offset", arg=self.lyrics.offset)
+            except Exception:
+                pass
+        else:
+            self.selected = max(0, self.selected + delta)
+
+    def _now_playing_hitbox(self, x: int, y: int) -> None:
+        """Bespoke now-playing click routing (tabs, transport, overlays)."""
+        if self.overlay is not None:
+            if self._overlay_rect is not None:
+                ox0, oy0, ox1, oy1 = self._overlay_rect
+                if not (ox0 <= x < ox1 and oy0 <= y < oy1):
+                    self.close_overlay()
+                    return
+            for ry, rx0, rx1, r_idx in self._overlay_row_hitboxes:
+                if y == ry and rx0 <= x <= rx1:
+                    if self.overlay == "search" and 0 <= r_idx < len(self.picker.results):
+                        self.picker.selected = r_idx
+                        res = self.picker.selected_result()
+                        if res and res.get("id"):
+                            try:
+                                self._send_play_id(str(res["id"]))
+                                self.toast = f"Playing {sanitize_untrusted(res.get('title')) or res['id']}"
+                                self.close_overlay()
+                            except Exception as exc:
+                                self.toast = sanitize_untrusted(exc)
+                    elif self.overlay == "command":
+                        filtered = command_palette_search(self.command_query)
+                        if 0 <= r_idx < len(filtered):
+                            entry = filtered[r_idx]
+                            self.close_overlay()
+                            self._execute_command(entry)
+                    return
+            return
+        # 1. Top view tabs (row 0)
+        if y == 0:
+            for tx0, tx1, view_key in self._tab_hitboxes:
+                if tx0 <= x <= tx1:
+                    self.view = view_key
+                    return
+        # 2. Progress bar scrub click
+        if self._progress_hitbox is not None:
+            py, px0, pw, dur = self._progress_hitbox
+            if y == py and px0 <= x < px0 + pw and dur > 0:
+                ratio = max(0.0, min(1.0, (x - px0) / max(1, pw - 1)))
+                target_s = round(ratio * dur, 2)
+                send_command("jump", arg=target_s)
+                self.toast = f"Seeked to {mmss(target_s)}"
+                return
+        # 3. Now Playing ♥ Heart toggle
+        if self._heart_hitbox is not None:
+            hy, hx0, hx1 = self._heart_hitbox
+            if y == hy and hx0 <= x <= hx1:
+                resp = send_command("like")
+                if isinstance(resp, dict) and resp.get("ok"):
+                    self.toast = "Liked ♥" if resp.get("liked") else "Removed from Liked Songs"
+                return
+        # 4. Sidebar "▸ Play Liked Songs" button
+        if self._liked_hitbox is not None:
+            ly, lx0, lx1 = self._liked_hitbox
+            if y == ly and lx0 <= x <= lx1:
+                resp = send_command("play_liked")
+                if isinstance(resp, dict) and resp.get("ok"):
+                    self.toast = f"Playing {resp.get('loaded', 0)} Liked Songs ♥"
+                elif isinstance(resp, dict) and resp.get("error"):
+                    self.toast = sanitize_untrusted(resp["error"])
+                return
+        # 5. Transport footer buttons
+        for cy, cx0, cx1, c_act in self._control_hitboxes:
+            if y == cy and cx0 <= x <= cx1:
+                send_command(c_act)
+                return
+        # 6. Queue item rows (click to select; click selected item to play)
+        for qy, qx0, qx1, q_idx in self._queue_hitboxes:
+            if y == qy and qx0 <= x <= qx1:
+                if self.selected == q_idx and q_idx > 0:
+                    send_command("play_index", arg=q_idx - 1)
+                else:
+                    self.selected = q_idx
+                return
+
+    def _scroll_home(self, delta: int) -> None:
+        if self.show_home:
+            self.home.scroll_by(delta)
+        else:
+            # Non-home views scroll the queue selection, matching the wheel.
+            self.selected = max(0, self.selected + delta)
+
+    def _seek_to(self, rect: Any, px: int) -> None:
+        """Map a click or drag on a progress bar to a playback position."""
+        if not rect or rect.w <= 0:
+            return
+        frac = min(1.0, max(0.0, (px - rect.x) / rect.w))
+        try:
+            # When the duration is known (the rendered bar), also carry the
+            # absolute position: the daemon accepts `arg` seconds and the
+            # now-playing scrub contract is in seconds, while `value`
+            # carries the fraction the home surface asserts.
+            hitbox = self._progress_hitbox
+            if hitbox is not None and hitbox[3] > 0:
+                send_command("jump", arg=round(frac * hitbox[3], 2), value=round(frac, 4))
+            else:
+                send_command("jump", value=round(frac, 4))
+        except DAEMON_UNREACHABLE as exc:
+            self.toast = str(exc)
+
+    def _seek_at(self, bar_row: int, bar_x: int, bar_w: int) -> None:
+        """Action bound to the registered progress bar.
+
+        `handle_mouse` seeks from the press column via `_seek_to`; this exists
+        so the bar can be registered against a real callable, keeping the
+        "drawn means wired" rule identical between the player view and the home
+        surface. Invoked directly (keyboard/screen-reader path) it seeks to the
+        start of the track's elapsed span, which is a well-defined no-op-free
+        operation rather than an invented one.
+        """
+        frac = min(1.0, max(0.0, float(self._last_position) / 3600.0))
+        try:
+            send_command("jump", value=round(frac, 4))
+        except DAEMON_UNREACHABLE as exc:
+            self.toast = str(exc)
+
+    def dead_affordances(self) -> list[str]:
+        """Ids drawn as controls that would do nothing. Should always be empty."""
+        return self.interactive.dead_affordances()
     def _apply_search_response(self, q: str, resp: Any, exc: Exception | None = None) -> None:
         if exc is not None:
             err_msg = sanitize_untrusted(exc) or "search failed"
@@ -1208,7 +1628,44 @@ class Renderer:
         self.lyrics.load_from_state(state)
         self._update_chameleon(state.get("thumb"))
         self.ensure_spectrum(state)
+        try:
+            self._last_position = float(state.get("position") or 0)
+        except (TypeError, ValueError):
+            self._last_position = 0.0
         cols, rows = size or shutil.get_terminal_size((100, 32))
+
+        # For You takes the whole screen when it is the active surface. It owns
+        # its own search bar, so it never shares a frame with the now-playing
+        # layout — two competing chrome bars would be its own dead end.
+        if self.show_home:
+            canvas = [bg("bg") + fg("fg") + " " * cols + RESET for _ in range(rows)]
+
+            def put(y: int, x: int, text: str) -> None:
+                if not (0 <= y < rows) or x >= cols:
+                    return
+                x = max(0, x)
+                vis = cell_len(text)
+                allow = cols - x
+                if vis > allow:
+                    text = clip(text, allow)
+                    vis = cell_len(text)
+                raw = strip_ansi(canvas[y])
+                pre = _plain_between(raw, 0, x)
+                post = _plain_between(raw, x + vis) if x + vis < cols else ""
+                canvas[y] = bg("bg") + fg("fg") + pre + text + post + RESET
+
+            self.render_home(put, state, cols, rows)
+            if self.toast:
+                put(
+                    rows - 2,
+                    2,
+                    fg("accent") + crop(self.toast, max(0, cols - 4)) + RESET,
+                )
+            put(rows - 1, 0, fg("dim") + crop(HOME_FOOTER, cols) + RESET)
+            frame = CLEAR + HIDE + "\n".join(canvas)
+            self.out.write(frame)
+            self.out.flush()
+            return frame
         cols = max(10, cols)
         rows = max(6, rows)
         left_w = max(20, min(cols - 12, int(cols * 0.38))) if cols >= 36 else max(10, cols // 2)
@@ -1575,6 +2032,20 @@ class Renderer:
             + f" {mmss(dur)}"
             + RESET,
         )
+        # The progress bar *looks* like a control, so it must be one. It is
+        # registered with the same guard the home surface uses: no registration
+        # without a seek action behind it. Without this the bar was drawn,
+        # looked clickable, and did nothing — exactly the dead affordance this
+        # build is meant to eliminate.
+        if dur > 0:
+            self.interactive.clear()
+            self.interactive.add(
+                "seek:main",
+                Rect(bar_x0, bar_row, bar_w, 1),
+                self._seek_at,
+                (bar_row, bar_x0, bar_w),
+                keys=("drag",),
+            )
         if dur > 0:
             self._progress_hitbox = (bar_row, bar_x0, bar_w, dur)
 
@@ -2159,128 +2630,106 @@ class Renderer:
         except Exception as exc:
             self.toast = sanitize_untrusted(exc)
 
-    def handle_mouse(self, btn: int, col1: int, row1: int, pressed: bool) -> bool:
-        """Process SGR 1006 mouse clicks & scroll wheel events (1-based coords)."""
-        x = max(0, col1 - 1)
-        y = max(0, row1 - 1)
+    def _handle_home_key(self, key: str) -> bool:
+        """Keys on the For You screen.
 
-        # Mouse wheel: 64 = wheel up, 65 = wheel down
-        if btn in (64, 65):
-            delta = -1 if btn == 64 else 1
-            if self.overlay == "search":
-                self.picker.move(delta)
-            elif self.overlay == "command":
-                filtered = command_palette_search(self.command_query)
-                self.command_selected = max(
-                    0, min(max(0, len(filtered) - 1), self.command_selected + delta)
-                )
-            elif self.view == "lyrics" and x > self._left_w:
-                self.lyrics.offset = round(self.lyrics.offset - delta * 0.5, 2)
-                try:
-                    send_command("lyrics_offset", arg=self.lyrics.offset)
-                except Exception:
-                    pass
+        Focus is real: with the search bar focused, printable keys edit the
+        query; otherwise they move the card selection or trigger app actions.
+        """
+        if self.search_bar.focused:
+            if key == "\x1b":
+                self.search_bar.blur()
+                return True
+            if key in ("\r", "\n"):
+                self._submit_search(self.search_bar.query)
+                self.search_bar.blur()
+                return True
+            if key in ("\x7f", "\x08", "\b"):
+                self.search_bar.backspace()
+                return True
+            if key == "\x15":  # ctrl-u clears the field
+                self.search_bar.clear()
+                return True
+            if key == "\t":
+                self.search_bar.blur()
+                return True
+            if len(key) == 1 and key.isprintable():
+                self.search_bar.type_char(key)
+                return True
+            return True
+
+        # Unfocused: navigation and app-level actions.
+        if key in ("\t", "/"):
+            self.search_bar.focus()
+            return True
+        if key in ("\x1b[A", "k"):
+            self.home.move_selection(-1)
+            return True
+        if key in ("\x1b[B", "j"):
+            self.home.move_selection(1)
+            return True
+        if key in ("H", "K", "\x1b[5~"):
+            self.home.focus_shelf(-1)
+            return True
+        if key in ("L", "J", "\x1b[6~"):
+            self.home.focus_shelf(1)
+            return True
+        if key == "\x04":  # ctrl-d scrolls down
+            self.home.scroll_by(2)
+            return True
+        if key == "\x15":  # ctrl-u scrolls up
+            self.home.scroll_by(-2)
+            return True
+        if key in ("\r", "\n"):
+            track = self.home.current_track
+            if track is not None:
+                self._play_track(track)
             else:
-                self.selected = max(0, self.selected + delta)
+                self.toast = "Nothing to play here yet"
             return True
-
-        # Only trigger actions on left-button press (btn == 0 and pressed == True)
-        if btn != 0 or not pressed:
+        if key == "f":
+            track = self.home.current_track
+            if track is not None and track.id:
+                self._toggle_favourite(track)
+            else:
+                self.toast = "Nothing to like here yet"
             return True
-
-        if self.overlay is not None:
-            if self._overlay_rect is not None:
-                ox0, oy0, ox1, oy1 = self._overlay_rect
-                if not (ox0 <= x < ox1 and oy0 <= y < oy1):
-                    self.close_overlay()
-                    return True
-            for ry, rx0, rx1, r_idx in self._overlay_row_hitboxes:
-                if y == ry and rx0 <= x <= rx1:
-                    if self.overlay == "search" and 0 <= r_idx < len(self.picker.results):
-                        self.picker.selected = r_idx
-                        res = self.picker.selected_result()
-                        if res and res.get("id"):
-                            try:
-                                self._send_play_id(str(res["id"]))
-                                self.toast = f"Playing {sanitize_untrusted(res.get('title')) or res['id']}"
-                                self.close_overlay()
-                            except Exception as exc:
-                                self.toast = sanitize_untrusted(exc)
-                    elif self.overlay == "command":
-                        filtered = command_palette_search(self.command_query)
-                        if 0 <= r_idx < len(filtered):
-                            entry = filtered[r_idx]
-                            self.close_overlay()
-                            self._execute_command(entry)
-                    return True
+        if key == "?":
+            self.open_help()
             return True
-
-        try:
-            # 1. Top view tabs (row 0)
-            if y == 0:
-                for tx0, tx1, view_key in self._tab_hitboxes:
-                    if tx0 <= x <= tx1:
-                        self.view = view_key
-                        return True
-
-            # 2. Progress bar scrub click
-            if self._progress_hitbox is not None:
-                py, px0, pw, dur = self._progress_hitbox
-                if y == py and px0 <= x < px0 + pw and dur > 0:
-                    ratio = max(0.0, min(1.0, (x - px0) / max(1, pw - 1)))
-                    target_s = round(ratio * dur, 2)
-                    send_command("jump", arg=target_s)
-                    self.toast = f"Seeked to {mmss(target_s)}"
-                    return True
-
-            # 3. Now Playing ♥ Heart toggle
-            if self._heart_hitbox is not None:
-                hy, hx0, hx1 = self._heart_hitbox
-                if y == hy and hx0 <= x <= hx1:
-                    resp = send_command("like")
-                    if isinstance(resp, dict) and resp.get("ok"):
-                        self.toast = "Liked ♥" if resp.get("liked") else "Removed from Liked Songs"
-                    return True
-
-            # 4. Sidebar "▸ Play Liked Songs" button
-            if self._liked_hitbox is not None:
-                ly, lx0, lx1 = self._liked_hitbox
-                if y == ly and lx0 <= x <= lx1:
-                    resp = send_command("play_liked")
-                    if isinstance(resp, dict) and resp.get("ok"):
-                        self.toast = f"Playing {resp.get('loaded', 0)} Liked Songs ♥"
-                    elif isinstance(resp, dict) and resp.get("error"):
-                        self.toast = sanitize_untrusted(resp["error"])
-                    return True
-
-            # 5. Transport footer buttons
-            for cy, cx0, cx1, c_act in self._control_hitboxes:
-                if y == cy and cx0 <= x <= cx1:
-                    send_command(c_act)
-                    return True
-
-            # 6. Queue item rows (click to select; click selected item to play)
-            for qy, qx0, qx1, q_idx in self._queue_hitboxes:
-                if y == qy and qx0 <= x <= qx1:
-                    if self.selected == q_idx and q_idx > 0:
-                        send_command("play_index", arg=q_idx - 1)
-                    else:
-                        self.selected = q_idx
-                    return True
-        except Exception as exc:
-            self.toast = sanitize_untrusted(exc)
+        if key == "\x0b":  # ctrl-k
+            self.open_command_palette()
+            return True
+        if key == "q":
+            try:
+                send_command("quit")
+            except DAEMON_UNREACHABLE as exc:
+                self.toast = str(exc)
+            return False
+        if len(key) == 1 and key.isprintable() and key != " ":
+            # Typing anywhere focuses search, so no key needs to be memorised.
+            self.search_bar.focus()
+            self.search_bar.type_char(key)
+            return True
+        if key == " ":
+            try:
+                send_command("toggle")
+            except DAEMON_UNREACHABLE as exc:
+                self.toast = str(exc)
         return True
 
     def handle_key(self, key: str) -> bool:
-        m_mouse = _SGR_MOUSE_RE.match(key)
-        if m_mouse:
-            return self.handle_mouse(
-                int(m_mouse.group(1)),
-                int(m_mouse.group(2)),
-                int(m_mouse.group(3)),
-                m_mouse.group(4) == "M",
-            )
-
+        # Mouse reports arrive as SGR sequences; route them to the unified
+        # mouse handler first so a click is never read as a keypress.
+        if "\x1b[<" in key:
+            for event in parse_mouse(key):
+                if not self.handle_mouse(event):
+                    return False
+            return True
+        # The For You surface owns its own focus model while it is active.
+        if self.show_home:
+            return self._handle_home_key(key)
+        # overlay handling first
         if self.overlay == "search":
             return self._handle_search_key(key)
         if self.overlay == "command":
@@ -2468,17 +2917,25 @@ def _read_escape_sequence(stream: IO[str], wait_s: float = 0.03) -> str:
         sel.close()
 
 
-def run(state_path: Path = STATE_PATH, out: IO[str] = sys.stdout) -> int:
+def run(
+    state_path: Path = STATE_PATH,
+    out: IO[str] = sys.stdout,
+    show_home: bool = False,
+) -> int:
     load_theme()
     renderer = Renderer(state_path=state_path, out=out)
     renderer.spectrum_auto = True
+    # `show_home` is the no-argument launch surface: For You, not an empty
+    # now-playing panel with a hint nobody reads.
+    renderer.show_home = show_home
+    renderer.load_library()
     renderer.async_search = True
     old = None
     interactive = out.isatty() and sys.stdin.isatty()
     if interactive:
         old = termios.tcgetattr(sys.stdin.fileno())
         tty.setcbreak(sys.stdin.fileno())
-        out.write(ALT_ON + HIDE + MOUSE_ON)
+        out.write(ALT_ON + HIDE + ENABLE_MOUSE)
         out.flush()
     sel = selectors.DefaultSelector()
     if interactive:
@@ -2500,12 +2957,18 @@ def run(state_path: Path = STATE_PATH, out: IO[str] = sys.stdout) -> int:
                     running = renderer.handle_key(key)
                     if not running:
                         break
+                if not running:
+                    break
             if not interactive:
                 break
             time.sleep(max(0, deadline - time.time()))
     finally:
         sel.close()
         renderer.spectrum.close()
+        if interactive:
+            # Always turn mouse reporting back off, even on an exception, so no
+            # terminal is left in a reporting state.
+            out.write(DISABLE_MOUSE)
         if interactive and old:
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
             out.write(MOUSE_OFF + SHOW + ALT_OFF)
