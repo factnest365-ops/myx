@@ -2,8 +2,8 @@
 
 import json
 
-from myx import library as lib
-from myx.library import (
+from myx import home as lib
+from myx.home import (
     HISTORY_LIMIT,
     Library,
     artist_key,

@@ -1,0 +1,170 @@
+name: Release Packages (PyPI, uv, GitHub, Homebrew)
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 0.3.0) when triggered manually"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  build:
+    name: Test & Build Wheel + Sdist
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve release version
+        id: meta
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.version }}" ]]; then
+            VER="${{ inputs.version }}"
+            VER="${VER#v}"
+          elif [[ "${GITHUB_REF_NAME}" == v* ]]; then
+            VER="${GITHUB_REF_NAME#v}"
+          else
+            VER="$(python3 -c 'import myx; print(myx.__version__)')"
+          fi
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify packaging & run full test suite
+        run: |
+          python3 scripts/bump_release.py "${{ steps.meta.outputs.version }}"
+          python3 scripts/bump_release.py --verify
+          uv sync --extra dev
+          uv run pytest -q
+
+      - name: Build Python sdist and wheel
+        run: |
+          uv build
+          ls -lh dist/
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: dist/*
+
+  github-release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "MYX $TAG" --generate-notes
+          fi
+
+  pypi:
+    name: Publish to PyPI (pip / uv / pipx)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist
+
+      - name: Publish via PYPI_API_TOKEN (if configured)
+        if: env.UV_PUBLISH_TOKEN != ''
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: uv publish dist/*
+
+      - name: Publish via PyPI Trusted Publishing OIDC (if token not set)
+        if: env.HAS_TOKEN == ''
+        continue-on-error: true
+        env:
+          HAS_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+
+  update-homebrew:
+    name: Update Homebrew Formula & Tap
+    needs: [build, github-release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Compute release tarball SHA256 & update Formula/myx.rb
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VER: ${{ needs.build.outputs.version }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/tarball/${TAG}" > "/tmp/myx-${TAG}.tar.gz"
+          SHA="$(sha256sum "/tmp/myx-${TAG}.tar.gz" | awk '{print $1}')"
+          python3 scripts/bump_release.py "$VER" --sha256 "$SHA" --refresh-resources
+          python3 scripts/bump_release.py --verify --require-release-sha
+
+      - name: Commit updated Formula/myx.rb to main
+        run: |
+          if git diff --quiet Formula/myx.rb pyproject.toml uv.lock myx/__init__.py; then
+            echo "Packaging files already up to date."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/myx.rb pyproject.toml uv.lock myx/__init__.py
+          git commit -m "chore(release): update Formula/myx.rb and metadata for v${{ needs.build.outputs.version }} [skip ci]"
+          git push origin HEAD:main
+
+      - name: Sync to external homebrew-myx tap (optional)
+        if: env.TAP_TOKEN != ''
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO || 'factnest365-ops/homebrew-myx' }}
+        run: |
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/${TAP_REPO}.git" /tmp/tap
+          mkdir -p /tmp/tap/Formula
+          cp Formula/myx.rb /tmp/tap/Formula/myx.rb
+          cd /tmp/tap
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Formula/myx.rb
+            git commit -m "myx ${{ needs.build.outputs.version }}"
+            git push
+          fi

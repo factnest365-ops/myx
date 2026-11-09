@@ -2,7 +2,7 @@ import io
 import json
 
 from myx import tui
-from myx.library import Library
+from myx.home import Library
 
 
 def test_malformed_library_does_not_crash_launch(monkeypatch, tmp_path):

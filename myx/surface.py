@@ -27,7 +27,7 @@ from typing import Any
 
 from .ansi import cell_len, crop, pad, styled
 from .design import Metrics, Role
-from .library import Library, Shelf, Track, home_shelves
+from .home import Library, Shelf, Track, home_shelves
 from .mouse import InteractiveMap, Rect
 
 # Visual grammar. Every one of these only ever appears on an element that was

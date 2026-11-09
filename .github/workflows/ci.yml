@@ -1,43 +1,48 @@
-name: ci
+name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
-  test:
+  test-and-package:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-14]
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.12"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install system deps
-        run: |
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            brew install mpv yt-dlp ffmpeg
-          else
-            sudo apt-get update
-            sudo apt-get install -y mpv ffmpeg
-            (command -v yt-dlp || pipx install yt-dlp)
-          fi
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
-      - name: Sync project
-        run: uv sync --extra dev
-
-      - name: External bins present
+      - name: Verify packaging & Homebrew formula metadata
         run: |
-          command -v mpv
-          command -v yt-dlp
-          command -v ffmpeg
+          python3 scripts/bump_release.py --verify
+          if command -v ruby >/dev/null 2>&1; then
+            ruby -c Formula/myx.rb
+          fi
+          bash -n scripts/install.sh
 
-      - name: Tests
-        run: uv run pytest -q
+      - name: Sync environment from uv.lock & run test suite
+        run: |
+          uv sync --extra dev
+          uv run pytest -q
+
+      - name: Build wheel & sdist and smoke-test CLI install
+        run: |
+          uv build
+          ls -lh dist/
+          uv venv /tmp/myx-wheel-smoke
+          uv pip install --python /tmp/myx-wheel-smoke/bin/python dist/*.whl
+          /tmp/myx-wheel-smoke/bin/myx --version
+          /tmp/myx-wheel-smoke/bin/myx update --check

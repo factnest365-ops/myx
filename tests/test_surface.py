@@ -9,7 +9,7 @@ from typing import Any
 
 from myx.ansi import cell_len, strip_ansi
 from myx.design import metrics
-from myx.library import Library, home_shelves
+from myx.home import Library, home_shelves
 from myx.mouse import InteractiveMap, MouseButton, MouseEvent, MouseKind
 from myx.surface import (
     CHEVRON,

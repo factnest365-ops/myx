@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from myx import cli, tui
-from myx.library import Library, Track
+from myx.home import Library, Track
 from myx.mouse import (
     DISABLE_MOUSE,
     ENABLE_MOUSE,
@@ -602,7 +602,7 @@ def test_mouse_reporting_sequences_are_written_on_entry_and_exit(monkeypatch):
 import sys
 from pathlib import Path
 from myx import tui
-from myx.library import Library
+from myx.home import Library
 
 def fake_read_state(path):
     return {"playing": False, "title": "MYX", "queue": []}
